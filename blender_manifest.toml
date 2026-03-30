@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "simple_camera_match"
-version = "1.0.0"
+version = "1.0.1"
 name = "Simple Camera Match"
 tagline = "Reconstruct camera perspective by drawing lines"
 maintainer = "WittyMing"
