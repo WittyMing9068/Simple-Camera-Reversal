@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "简易相机反求",
+    "name": "Simple Camera Match",
     "author": "WittyMing",
     "version": (1, 0),
     "blender": (3, 0, 0),
     "location": "View3D > N-Panel > CameraMatch",
-    "description": "通过绘制线条反求相机视角",
+    "description": "Reconstruct camera perspective by drawing lines",
     "warning": "",
     "doc_url": "",
     "category": "Camera",
@@ -16,8 +16,10 @@ from . import gpu_draw
 from . import ui
 from . import operators
 from . import tool
+from . import translation
 
 def register():
+    translation.register()
     properties.register()
     gpu_draw.register()
     ui.register()
@@ -30,6 +32,7 @@ def unregister():
     ui.unregister()
     gpu_draw.unregister()
     properties.unregister()
+    translation.unregister()
 
 if __name__ == "__main__":
     register()

@@ -7,9 +7,9 @@ from mathutils import Vector
 from bpy_extras import view3d_utils
 
 class CMP_OT_DrawLine(bpy.types.Operator):
-    """绘制 2D 相机匹配参考线 (重构为 3D)"""
+    """Draw 2D camera match reference lines (rebuilt as 3D)"""
     bl_idname = "cmp.draw_line"
-    bl_label = "绘制参考线"
+    bl_label = "Draw Reference Line"
     bl_options = {'REGISTER', 'UNDO'}
 
     STATE_IDLE = 'IDLE'       
@@ -23,16 +23,16 @@ class CMP_OT_DrawLine(bpy.types.Operator):
     active_handle = -1
     drag_start_x = 0
     drag_start_y = 0
-    DRAG_THRESHOLD = 10 # 像素
+    DRAG_THRESHOLD = 10
     
     def invoke(self, context, event):
         if not context.scene.camera:
-            self.report({'WARNING'}, "请先添加摄像机")
+            self.report({'WARNING'}, "Please add a camera first")
             return {'CANCELLED'}
             
         self.state = self.STATE_IDLE
         self.current_axis = 'X'
-        self.last_error = "" # 初始化 last_error
+        self.last_error = ""
         context.scene.cmp_data.active_index = -1
         context.scene.cmp_data.is_drawing_mode = True 
         
@@ -43,12 +43,13 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         
     def update_header(self, context):
         try:
-            cols = {'X':'红X', 'Y':'绿Y', 'Z':'蓝Z'}
+            iface_ = bpy.app.translations.pgettext_iface
+            cols = {'X': iface_('Red X'), 'Y': iface_('Green Y'), 'Z': iface_('Blue Z')}
             c = cols.get(self.current_axis, "")
-            base = f"CameraMatch [3D模式]: 当前轴 {c} (1/2/3). 拖拽绘制 | 点圆点编辑 | Ctrl+Z 撤销 | 右键退出"
+            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Right click exit") % c
             
             if self.last_error:
-                msg = f"{base} | 错误: {self.last_error}"
+                msg = base + iface_(" | Error: ") + iface_(self.last_error)
             else:
                 msg = base
                 
@@ -68,7 +69,6 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         # 快捷键
         if event.value == 'PRESS':
             if event.ctrl and event.type == 'Z':
-                # 撤销上一条线
                 lines = context.scene.cmp_data.lines
                 if len(lines) > 0:
                     lines.remove(len(lines)-1)
@@ -109,12 +109,9 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                     else: line.end = norm
                     self.trigger_solve(context)
             elif self.state == self.STATE_WAITING_DRAG:
-                # 检查距离
                 dist = np.hypot(x - self.drag_start_x, y - self.drag_start_y)
                 if dist > self.DRAG_THRESHOLD:
-                    # 距离足够，开始绘制
                     self.start_drawing(context, self.drag_start_x, self.drag_start_y)
-                    # 立即更新当前位置到鼠标位置
                     norm = self.screen_to_norm(context, x, y)
                     if norm and lines:
                          lines[-1].end = norm
@@ -128,11 +125,9 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                     context.scene.cmp_data.active_index = dot
                     self.state = self.STATE_EDITING
                 else:
-                    # 不直接开始绘制，而是等待拖拽
                     self.drag_start_x = x
                     self.drag_start_y = y
                     self.state = self.STATE_WAITING_DRAG
-                    # self.start_drawing(context, x, y)
             elif self.state == self.STATE_EDITING:
                 h = self.check_endpoint_click(context, x, y, idx)
                 if h != -1:
@@ -152,7 +147,6 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 context.scene.cmp_data.active_index = -1
                 context.scene.cmp_data.is_creating_line = False
             elif self.state == self.STATE_WAITING_DRAG:
-                 # 松开时如果还在等待，说明没有拖拽 -> 是单击 -> 取消
                  self.state = self.STATE_IDLE
                  context.scene.cmp_data.active_index = -1
             elif self.state == self.STATE_DRAGGING:
@@ -181,7 +175,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 self.last_error = ""
             self.update_header(context)
         except Exception as e:
-            print(e) # 调试
+            print(e)
             pass
 
     def quit(self, context):
@@ -194,7 +188,6 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
     # --- 辅助函数 ---
     def screen_to_norm(self, context, x, y):
-        # 交互所需的逆投影
         region = context.region
         rv3d = context.region_data
         cam = context.scene.camera
@@ -212,7 +205,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         cam = context.scene.camera
         if not cam: return -1
         TR, TL, BL, BR = get_ordered_frame_points(context)
-        if not TR: return -1 # 修复崩溃
+        if not TR: return -1
         
         region = context.region; rv3d = context.region_data
         mw = cam.matrix_world
@@ -236,12 +229,12 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
     def check_endpoint_click(self, context, x, y, idx):
         if idx == -1: return -1
-        lines = context.scene.cmp_data.lines # Fix index out of range check needed?
+        lines = context.scene.cmp_data.lines
         if idx >= len(lines): return -1
         line = lines[idx]
         cam = context.scene.camera
         TR, TL, BL, BR = get_ordered_frame_points(context)
-        if not TR: return -1 # 修复崩溃
+        if not TR: return -1
         
         region = context.region; rv3d = context.region_data
         mw = cam.matrix_world
@@ -272,9 +265,7 @@ def get_ordered_frame_points(context):
         elif v.x < 0 and v.y < 0: BL = v
         elif v.x > 0 and v.y < 0: BR = v
     
-    # 如果找不到特定角（例如正交相机），回退到默认顺序
     if not all([TR, TL, BL, BR]):
-        # 此顺序基于原始代码的回退
         TR, TL, BL, BR = frame[0], frame[1], frame[3], frame[2]
         
     return TR, TL, BL, BR
