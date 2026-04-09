@@ -2,6 +2,87 @@ import bpy
 import numpy as np
 import mathutils
 
+
+def is_camera_view(context):
+    area = getattr(context, "area", None)
+    space_data = getattr(context, "space_data", None)
+    rv3d = getattr(space_data, "region_3d", None)
+    if not area or area.type != 'VIEW_3D' or rv3d is None:
+        return False
+    return rv3d.view_perspective == 'CAMERA'
+
+
+def get_effective_render_size(render):
+    scale = render.resolution_percentage / 100.0
+    res_x = render.resolution_x * scale * render.pixel_aspect_x
+    res_y = render.resolution_y * scale * render.pixel_aspect_y
+    return res_x, res_y
+
+
+def distance_point_to_segment_2d(point, start, end):
+    point = np.array(point, dtype=float)
+    start = np.array(start, dtype=float)
+    end = np.array(end, dtype=float)
+    segment = end - start
+    segment_length_sq = np.dot(segment, segment)
+    if segment_length_sq <= 1e-12:
+        return np.linalg.norm(point - start)
+    t = np.dot(point - start, segment) / segment_length_sq
+    t = np.clip(t, 0.0, 1.0)
+    closest = start + t * segment
+    return np.linalg.norm(point - closest)
+
+
+def rotate_matrix_around_point(matrix_world, rotation_matrix, pivot):
+    return (
+        mathutils.Matrix.Translation(pivot)
+        @ rotation_matrix
+        @ mathutils.Matrix.Translation(-pivot)
+        @ matrix_world
+    )
+
+
+def register_class_safe(cls):
+    try:
+        bpy.utils.register_class(cls)
+    except ValueError:
+        bpy.utils.unregister_class(cls)
+        bpy.utils.register_class(cls)
+
+
+def unregister_class_safe(cls):
+    try:
+        bpy.utils.unregister_class(cls)
+    except Exception:
+        pass
+
+
+def get_ordered_frame_points(context):
+    cam = context.scene.camera
+    if not cam:
+        return None, None, None, None
+
+    try:
+        frame = cam.data.view_frame(scene=context.scene)
+    except Exception:
+        return None, None, None, None
+
+    TR, TL, BL, BR = None, None, None, None
+    for v in frame:
+        if v.x > 0 and v.y > 0:
+            TR = v
+        elif v.x < 0 and v.y > 0:
+            TL = v
+        elif v.x < 0 and v.y < 0:
+            BL = v
+        elif v.x > 0 and v.y < 0:
+            BR = v
+
+    if not all([TR, TL, BL, BR]):
+        return frame[0], frame[1], frame[3], frame[2]
+    return TR, TL, BL, BR
+
+
 def fit_line_2d(points_2d):
     """
     拟合 2D 直线: ax + by + c = 0
@@ -12,10 +93,10 @@ def fit_line_2d(points_2d):
     center = np.mean(points_2d, axis=0)
     uu, dd, vv = np.linalg.svd(points_2d - center)
     normal = vv[1] # 变异最小的方向即为法线
-    
+
     a, b = normal
     c = - (a * center[0] + b * center[1])
-    
+
     return np.array([a, b, c])
 
 def solve_svd(subset_lines):
@@ -158,7 +239,7 @@ def get_effective_f_pixels(f_mm, sensor_width_mm, sensor_height_mm, sensor_fit, 
         else:
              return (f_mm / sensor_height_mm) * pixel_height
 
-def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None):
+def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None, anchor_location=None):
     """
     vp_data: {'X':(u,v), ...} 以中心像素为单位
     axis_weights: {'X': count, ...} 各轴的线段数量权重
@@ -406,17 +487,16 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
     
     # 世界空间中的相机位置
     # P_org_world = R_cw @ P_org_cam + C_world
-    # 0 = R_cw @ P_org_cam + C_world
-    # C_world = - R_cw @ P_org_cam
-    
-    # rot_matrix 是 R_cw (相机 -> 世界)
+    # anchor = R_cw @ P_org_cam + C_world
+    # C_world = anchor - R_cw @ P_org_cam
+    anchor = mathutils.Vector(anchor_location) if anchor_location is not None else mathutils.Vector((0.0, 0.0, 0.0))
     vec_org_cam = mathutils.Vector(p_org_cam)
-    
-    loc_orbit = -(rot_matrix @ vec_org_cam)
-    
+
+    loc_orbit = anchor - (rot_matrix @ vec_org_cam)
+
     return f_mm_final, rot_matrix, shift_x, shift_y, loc_orbit
 
-def solve_camera_rotation_constrained(lines_data, f_pixels, cx, cy, current_rot_matrix):
+def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix):
     """
     使用单线（平面）和固定焦距求解旋转。
     lines_data: {'X': [[a,b,c,len],...], 'Y':...}
@@ -455,18 +535,6 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, cx, cy, current_rot_
         
     # 2. 优化
     # 我们希望 R = [rx, ry, rz] 使得 rx 垂直 Nx, ry 垂直 Ny, rz 垂直 Nz
-    # 从当前旋转开始
-    R_curr = np.array(current_rot_matrix).T # 转置以获得 [rx, ry, rz] 作为列？
-    # Blender 矩阵:
-    # Col 0: 右 (世界 X 在相机空间？不。相机 X 在世界空间。)
-    # 等等，我们想要相机方向矩阵 R_cam_to_world。
-    # 但在这里我们在相机空间工作。
-    # 世界 X 轴在相机空间是 R_world_to_cam * [1,0,0]^T = R_world_to_cam 的第 0 列。
-    # R_world_to_cam = R_cam_to_world.T
-    # 所以我们正在寻找 R_world_to_cam 的列。
-    # 令 R = R_world_to_cam。列是 u, v, w (在相机中看到的世界 X, Y, Z)。
-    # u 垂直 Nx, v 垂直 Ny, w 垂直 Nz。
-    
     # 使用当前的 R_world_to_cam 初始化
     R = np.array(current_rot_matrix).T # current_rot_matrix 是 Cam->World。转置 -> World->Cam。
     # 确保正交仅防万一
