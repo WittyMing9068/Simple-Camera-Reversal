@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Simple Camera Match",
     "author": "WittyMing",
-    "version": (1, 0, 3),
+    "version": (1, 0, 5),
     "blender": (4, 2, 0),
     "location": "View3D > N-Panel > CameraMatch",
     "description": "Reconstruct camera perspective by drawing lines",
@@ -21,14 +21,14 @@ from . import translation
 def register():
     translation.register()
     properties.register()
-    ui.register()
     operators.register()
     tool.register()
+    ui.register()
 
 def unregister():
+    ui.unregister()
     tool.unregister()
     operators.unregister()
-    ui.unregister()
     gpu_draw.unregister()
     properties.unregister()
     translation.unregister()
