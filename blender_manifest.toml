@@ -1,13 +1,29 @@
 schema_version = "1.0.0"
-blender_version_min = "4.2.0"
-version = "1.0.3"
-id = "simple_camera_match"
-name = "Simple Camera Match"
-tagline = "Simple Camera Match - Blender插件"
-license = ["SPDX:GPL-3.0-or-later"]
-maintainer = "WittyMing"
+
+id = "colorful_connections"
+version = "1.1.2"
+name = "彩色连线"
+tagline = "为Blender节点编辑器提供彩色连线功能，增强节点编辑体验"
+maintainer = "Blender超级技术交流社"
 type = "add-on"
-website = "https://space.bilibili.com/263206115?spm_id_from=333.1007.0.0"
-copyright = ["2026 WittyMing"]
-tags = ["Object","3D View","Scene"]
-platforms = ["windows-arm64","windows-x64"]
+
+website = "https://www.blender.org"
+
+tags = ["Node"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".*",
+  "*.zip",
+  "*.log",
+  "colorful_node_wrangler/",
+]
