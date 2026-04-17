@@ -22,16 +22,26 @@ def build_dashed_line(points, dash_length=12, gap_length=8):
     offset = (time.time() * speed) % (dash_length + gap_length)
 
     verts = []
+    max_segments = 2048
+    max_screen_length = 20000.0
+
     for i in range(len(points) - 1):
         a = points[i]
         b = points[i+1]
         vec = (b[0] - a[0], b[1] - a[1])
         length = math.hypot(vec[0], vec[1])
         if length == 0: continue
+
+        # 防止极端坐标导致虚线细分循环过大造成卡死
+        if length > max_screen_length:
+            verts.extend((a, b))
+            continue
+
         dir = (vec[0] / length, vec[1] / length)
 
         current_pos = - (dash_length + gap_length) + offset
-        while current_pos < length:
+        seg_count = 0
+        while current_pos < length and seg_count < max_segments:
             start_d = max(0, current_pos)
             end_d = min(length, current_pos + dash_length)
 
@@ -41,8 +51,10 @@ def build_dashed_line(points, dash_length=12, gap_length=8):
                 verts.extend((start_pt, end_pt))
 
             current_pos += dash_length + gap_length
+            seg_count += 1
 
     return verts
+
 
 # 生成空心圆环顶点阵列 (类型为 LINES)
 def build_circle_lines(center, radius, seg=24):

@@ -18,10 +18,9 @@ def solve_camera_core(context):
     if len(lines) < 2: return False, "Not enough lines"
 
     render = scene.render
-    res_x, res_y = utils.get_effective_render_size(render)
-
-    cx = res_x / 2.0
-    cy = res_y / 2.0
+    pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+    cx = pixel_res_x * 0.5
+    cy = pixel_res_y * 0.5
 
     # 1. 准备数据
     lines_data = {'X': [], 'Y': [], 'Z': []}
@@ -30,16 +29,17 @@ def solve_camera_core(context):
         u1, v1 = line.start
         u2, v2 = line.end
 
-        px1 = u1 * res_x - cx
-        py1 = v1 * res_y - cy
-        px2 = u2 * res_x - cx
-        py2 = v2 * res_y - cy
+        px1 = u1 * pixel_res_x - cx
+        py1 = v1 * pixel_res_y - cy
+        px2 = u2 * pixel_res_x - cx
+        py2 = v2 * pixel_res_y - cy
 
         dx = px2 - px1
         dy = py2 - py1
         length = np.hypot(dx, dy)
 
-        if length < 10: continue
+        if length < 10:
+            continue
 
         a = -dy / length
         b = dx / length
@@ -72,7 +72,7 @@ def solve_camera_core(context):
             if count == 2:
                 weights = np.ones(count)
 
-            image_diag = np.hypot(res_x, res_y)
+            image_diag = np.hypot(pixel_res_x, pixel_res_y)
             vp = utils.solve_vanishing_point_2d(lines_abc, weights, image_diag=image_diag)
             if vp is not None:
                 vp_data[axis] = vp
@@ -83,12 +83,24 @@ def solve_camera_core(context):
     if current_dist < 0.1: current_dist = 10.0
 
     anchor_screen_offset = None
+    target_cursor_uv = None
     try:
         cursor_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+
+        principal_u = 0.5
+        principal_v = 0.5
+        probe_dist = max(current_dist, 1.0)
+        probe_world = cam.matrix_world.translation + (cam.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, -probe_dist)))
+        principal_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, probe_world)
+        if np.isfinite(principal_view.x) and np.isfinite(principal_view.y):
+            principal_u = float(principal_view.x)
+            principal_v = float(principal_view.y)
+
         if np.isfinite(cursor_view.x) and np.isfinite(cursor_view.y):
+            target_cursor_uv = (float(cursor_view.x), float(cursor_view.y))
             anchor_screen_offset = (
-                float(cursor_view.x * res_x - cx),
-                float(cursor_view.y * res_y - cy),
+                float((cursor_view.x - principal_u) * pixel_res_x),
+                float((cursor_view.y - principal_v) * pixel_res_y),
             )
     except Exception:
         anchor_screen_offset = None
@@ -107,7 +119,7 @@ def solve_camera_core(context):
                 cam.data.sensor_width,
                 cam.data.sensor_height,
                 cam.data.sensor_fit,
-                res_x, res_y, current_dist,
+                pixel_res_x, pixel_res_y, current_dist,
                 default_f_mm=cam.data.lens,
                 axis_weights=axis_weights,
                 anchor_location=cursor_location,
@@ -135,7 +147,7 @@ def solve_camera_core(context):
                 cam.data.sensor_width,
                 cam.data.sensor_height,
                 cam.data.sensor_fit,
-                res_x, res_y
+                pixel_res_x, pixel_res_y
             )
 
             rot_matrix = utils.solve_camera_rotation_constrained(
@@ -227,8 +239,93 @@ def solve_camera_core(context):
 
         cam.matrix_world = mathutils.Matrix.Translation(loc_orbit) @ new_rot_4x4
         context.view_layer.update()
-        utils.restore_camera_view_state(view_state)
 
+        if target_cursor_uv is not None:
+            try:
+                shift_eps = 1e-4
+                max_shift_step = 0.02
+
+                for _ in range(2):
+                    cur_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+                    if not (np.isfinite(cur_view.x) and np.isfinite(cur_view.y)):
+                        break
+
+                    err_u = target_cursor_uv[0] - float(cur_view.x)
+                    err_v = target_cursor_uv[1] - float(cur_view.y)
+                    err_px = np.hypot(err_u * pixel_res_x, err_v * pixel_res_y)
+                    if err_px < 0.25:
+                        break
+
+                    base_shift_x = float(cam.data.shift_x)
+                    base_shift_y = float(cam.data.shift_y)
+
+                    cam.data.shift_x = base_shift_x + shift_eps
+                    context.view_layer.update()
+                    view_sx = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+
+                    cam.data.shift_x = base_shift_x
+                    cam.data.shift_y = base_shift_y + shift_eps
+                    context.view_layer.update()
+                    view_sy = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+
+                    cam.data.shift_y = base_shift_y
+                    context.view_layer.update()
+
+                    if not (
+                        np.isfinite(view_sx.x) and np.isfinite(view_sx.y)
+                        and np.isfinite(view_sy.x) and np.isfinite(view_sy.y)
+                    ):
+                        break
+
+                    jac = np.array([
+                        [(float(view_sx.x) - float(cur_view.x)) / shift_eps, (float(view_sy.x) - float(cur_view.x)) / shift_eps],
+                        [(float(view_sx.y) - float(cur_view.y)) / shift_eps, (float(view_sy.y) - float(cur_view.y)) / shift_eps],
+                    ])
+
+                    if not np.all(np.isfinite(jac)):
+                        break
+
+                    try:
+                        if np.linalg.cond(jac) > 1e4:
+                            break
+                    except Exception:
+                        break
+
+                    delta, *_ = np.linalg.lstsq(jac, np.array([err_u, err_v]), rcond=None)
+                    if not np.all(np.isfinite(delta)):
+                        break
+
+                    dsx = float(np.clip(delta[0] * 0.7, -max_shift_step, max_shift_step))
+                    dsy = float(np.clip(delta[1] * 0.7, -max_shift_step, max_shift_step))
+
+                    cam.data.shift_x = base_shift_x + dsx
+                    cam.data.shift_y = base_shift_y + dsy
+                    context.view_layer.update()
+
+                    new_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+                    if not (np.isfinite(new_view.x) and np.isfinite(new_view.y)):
+                        cam.data.shift_x = base_shift_x
+                        cam.data.shift_y = base_shift_y
+                        context.view_layer.update()
+                        break
+
+                    new_err_u = target_cursor_uv[0] - float(new_view.x)
+                    new_err_v = target_cursor_uv[1] - float(new_view.y)
+                    new_err_px = np.hypot(new_err_u * pixel_res_x, new_err_v * pixel_res_y)
+                    if (not np.isfinite(new_err_px)) or new_err_px >= err_px:
+                        cam.data.shift_x = base_shift_x
+                        cam.data.shift_y = base_shift_y
+                        context.view_layer.update()
+                        break
+
+                if np.isfinite(cam.data.shift_x) and np.isfinite(cam.data.shift_y):
+                    shift_x = float(cam.data.shift_x)
+                    shift_y = float(cam.data.shift_y)
+
+            except Exception as e:
+                print(f"[CameraMatch] Cursor lock correction failed: {e}")
+
+        utils.restore_camera_view_state(view_state)
         scene.cmp_data.last_world_rotation = 0.0
         scene.cmp_data.last_flip_z = False
         scene.cmp_data.world_rotation = 0.0

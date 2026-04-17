@@ -12,6 +12,7 @@ class CMP_Line(bpy.types.PropertyGroup):
 class CMP_SceneProperties(bpy.types.PropertyGroup):
     lines: bpy.props.CollectionProperty(type=CMP_Line)
     active_index: bpy.props.IntProperty(default=-1)
+    lines_camera: bpy.props.PointerProperty(type=bpy.types.Object, description="Camera bound to current guide lines")
 
     is_drawing_mode: bpy.props.BoolProperty(default=False)
     is_creating_line: bpy.props.BoolProperty(default=False)

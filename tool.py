@@ -42,8 +42,18 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.undo_stack = []
         self.redo_stack = []
         self.drag_history = None
-        context.scene.cmp_data.active_index = -1
-        context.scene.cmp_data.is_drawing_mode = True
+
+        cmp_data = context.scene.cmp_data
+        cmp_data.active_index = -1
+        cmp_data.is_drawing_mode = True
+
+        if len(cmp_data.lines) == 0:
+            cmp_data.lines_camera = context.scene.camera
+        elif cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
+            self.clear_all_lines(context, push_history=False, run_solve=False)
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.last_error = "Active camera changed, guide lines cleared"
         try:
             from . import gpu_draw
             gpu_draw.register()
@@ -68,6 +78,10 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             c = cols.get(self.current_axis, "")
             mod = self.primary_modifier_label()
             base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | %s+Z undo | %s+Shift+Z redo | Alt+X clear all | Esc / Right click exit") % (c, mod, mod)
+
+            if context.scene.cmp_data.lines_camera is not None and context.scene.cmp_data.lines_camera != context.scene.camera:
+                camera_hint = iface_(" | Camera changed: press Alt+X to clear old guides")
+                base += camera_hint
 
             if self.last_error:
                 msg = base + iface_(" | Error: ") + iface_(self.last_error)
@@ -183,12 +197,14 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 self.state = self.STATE_IDLE
                 context.scene.cmp_data.active_index = -1
                 context.scene.cmp_data.is_creating_line = False
+                self.trigger_solve(context)
             elif self.state == self.STATE_WAITING_DRAG:
                 self.state = self.STATE_IDLE
                 context.scene.cmp_data.active_index = -1
             elif self.state == self.STATE_DRAGGING:
                 self.finish_drag_history(context)
                 self.state = self.STATE_EDITING
+                self.trigger_solve(context)
 
         return {'RUNNING_MODAL'}
 
@@ -251,19 +267,29 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             self.redo_stack.clear()
         self.drag_history = None
 
-    def clear_all_lines(self, context):
-        lines = context.scene.cmp_data.lines
+    def clear_all_lines(self, context, push_history=True, run_solve=True):
+        cmp_data = context.scene.cmp_data
+        lines = cmp_data.lines
         if len(lines) == 0:
+            cmp_data.lines_camera = context.scene.camera
             return
-        self.push_history(context)
+
+        if push_history:
+            self.push_history(context)
+
         while len(lines) > 0:
             lines.remove(len(lines) - 1)
-        context.scene.cmp_data.active_index = -1
+
+        cmp_data.lines_camera = context.scene.camera
+        cmp_data.active_index = -1
+        cmp_data.is_creating_line = False
         self.state = self.STATE_IDLE
         self.last_error = ""
         self.update_header(context)
         context.area.tag_redraw()
-        self.trigger_solve(context)
+
+        if run_solve:
+            self.trigger_solve(context)
 
     def start_drawing(self, context, x, y):
         norm = self.screen_to_norm(context, x, y)
@@ -280,6 +306,17 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
     def trigger_solve(self, context):
         try:
+            cmp_data = context.scene.cmp_data
+            if cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
+                self.last_error = "Guide lines belong to another camera. Press Alt+X to reset."
+                self.update_header(context)
+                return
+
+            if len(cmp_data.lines) < 2:
+                self.last_error = ""
+                self.update_header(context)
+                return
+
             from . import operators
             success, msg = operators.solve_camera_core(context)
             if not success:
@@ -316,7 +353,11 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             vec = view3d_utils.region_2d_to_vector_3d(region, rv3d, (x, y))
             loc = view3d_utils.region_2d_to_origin_3d(region, rv3d, (x, y)) + vec * 10
             co = bpy_extras.object_utils.world_to_camera_view(context.scene, cam, loc)
-            return Vector((co.x, co.y))
+            if not (np.isfinite(co.x) and np.isfinite(co.y)):
+                return None
+            u = float(np.clip(co.x, -0.5, 1.5))
+            v = float(np.clip(co.y, -0.5, 1.5))
+            return Vector((u, v))
         except Exception:
             return None
 
