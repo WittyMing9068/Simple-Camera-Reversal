@@ -1,6 +1,7 @@
 import bpy
 import numpy as np
 import mathutils
+import bpy_extras
 from . import utils
 
 
@@ -49,6 +50,8 @@ def solve_camera_core(context):
     # 保留当前的旋转微调状态，并在新解算结果上重新应用
     current_world_rotation = scene.cmp_data.world_rotation
     current_flip_z = scene.cmp_data.flip_z_axis
+    current_shift_x = cam.data.shift_x
+    current_shift_y = cam.data.shift_y
 
     # 2. 求解消失点 (VPs)
     vp_data = {}
@@ -79,6 +82,17 @@ def solve_camera_core(context):
     current_dist = (cam.location - cursor_location).length
     if current_dist < 0.1: current_dist = 10.0
 
+    anchor_screen_offset = None
+    try:
+        cursor_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+        if np.isfinite(cursor_view.x) and np.isfinite(cursor_view.y):
+            anchor_screen_offset = (
+                float(cursor_view.x * res_x - cx),
+                float(cursor_view.y * res_y - cy),
+            )
+    except Exception:
+        anchor_screen_offset = None
+
     f_mm = None
     rot_matrix = None
     shift_x = 0.0
@@ -97,6 +111,7 @@ def solve_camera_core(context):
                 default_f_mm=cam.data.lens,
                 axis_weights=axis_weights,
                 anchor_location=cursor_location,
+                anchor_screen_offset=anchor_screen_offset,
             )
         except Exception as e:
             print(f"[CameraMatch] Full solve failed: {e}")
@@ -131,7 +146,11 @@ def solve_camera_core(context):
                 iface_ = bpy.app.translations.pgettext_iface
                 return False, iface_("Rotation solving failed. Try drawing more lines.")
 
-            ray_cam = np.array([0.0, 0.0, -f_pixels])
+            target_px, target_py = (0.0, 0.0)
+            if anchor_screen_offset is not None:
+                target_px, target_py = anchor_screen_offset
+
+            ray_cam = np.array([target_px, target_py, -f_pixels])
             ray_cam /= np.linalg.norm(ray_cam)
             p_org_cam = ray_cam * current_dist
 
@@ -158,6 +177,10 @@ def solve_camera_core(context):
     if not (1.0 < f_mm < 10000.0):
         iface_ = bpy.app.translations.pgettext_iface
         return False, iface_("Abnormal focal length: ") + f"{f_mm:.1f}mm"
+
+    if abs(shift_x) < 1e-9 and abs(shift_y) < 1e-9:
+        shift_x = current_shift_x
+        shift_y = current_shift_y
 
     # 检查 shift 是否有效
     if not (np.isfinite(shift_x) and np.isfinite(shift_y)):
@@ -194,6 +217,7 @@ def solve_camera_core(context):
             loc_orbit = cam.location.copy()
 
     # 4. 应用
+    view_state = utils.capture_camera_view_state(context)
     try:
         cam.data.lens = f_mm
         cam.data.shift_x = shift_x
@@ -202,6 +226,8 @@ def solve_camera_core(context):
         new_rot_4x4 = rot_matrix.to_4x4()
 
         cam.matrix_world = mathutils.Matrix.Translation(loc_orbit) @ new_rot_4x4
+        context.view_layer.update()
+        utils.restore_camera_view_state(view_state)
 
         scene.cmp_data.last_world_rotation = 0.0
         scene.cmp_data.last_flip_z = False

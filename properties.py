@@ -29,6 +29,7 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
             return
 
         pivot = context.scene.cursor.location.copy()
+        view_state = utils.capture_camera_view_state(context)
 
         delta_rot = self.world_rotation - self.last_world_rotation
         self.last_world_rotation = self.world_rotation
@@ -41,6 +42,9 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
             self.last_flip_z = self.flip_z_axis
             flip_mat = mathutils.Matrix.Rotation(math.pi, 4, 'X')
             cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, flip_mat, pivot)
+
+        context.view_layer.update()
+        utils.restore_camera_view_state(view_state)
 
     world_rotation: bpy.props.FloatProperty(
         name="3D Cursor Rotation",

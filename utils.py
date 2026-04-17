@@ -12,6 +12,92 @@ def is_camera_view(context):
     return rv3d.view_perspective == 'CAMERA'
 
 
+def get_camera_view_region_data(context):
+    area = getattr(context, "area", None)
+    space_data = getattr(context, "space_data", None)
+    if not area or area.type != 'VIEW_3D' or space_data is None:
+        return None
+
+    rv3d = getattr(context, "region_data", None) or getattr(space_data, "region_3d", None)
+    if rv3d is None or rv3d.view_perspective != 'CAMERA':
+        return None
+
+    scene = getattr(context, "scene", None)
+    if scene is None or scene.camera is None:
+        return None
+
+    space_camera = getattr(space_data, "camera", None)
+    if space_camera is not None and space_camera != scene.camera:
+        return None
+
+    return rv3d
+
+
+def iter_camera_view_regions(context):
+    scene = getattr(context, "scene", None)
+    screen = getattr(context, "screen", None)
+
+    if scene is None or scene.camera is None:
+        return
+
+    if screen is not None:
+        for area in screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+
+            space = getattr(area.spaces, "active", None)
+            if space is None or space.type != 'VIEW_3D':
+                continue
+
+            rv3d = getattr(space, "region_3d", None)
+            if rv3d is None or rv3d.view_perspective != 'CAMERA':
+                continue
+
+            space_camera = getattr(space, "camera", None)
+            if space_camera is not None and space_camera != scene.camera:
+                continue
+
+            yield area, rv3d
+        return
+
+    area = getattr(context, "area", None)
+    rv3d = get_camera_view_region_data(context)
+    if area is not None and rv3d is not None:
+        yield area, rv3d
+
+
+def capture_camera_view_state(context):
+    states = []
+    for area, rv3d in iter_camera_view_regions(context):
+        states.append({
+            "area": area,
+            "region_3d": rv3d,
+            "offset": tuple(rv3d.view_camera_offset),
+            "zoom": rv3d.view_camera_zoom,
+        })
+    return states
+
+
+def restore_camera_view_state(state):
+    if not state:
+        return
+
+    for entry in state:
+        area = entry.get("area")
+        rv3d = entry.get("region_3d")
+        if area is None or rv3d is None:
+            continue
+
+        try:
+            if getattr(rv3d, "view_perspective", None) != 'CAMERA':
+                continue
+            rv3d.view_camera_offset = entry["offset"]
+            rv3d.view_camera_zoom = entry["zoom"]
+            area.tag_redraw()
+        except Exception:
+            continue
+
+
 def get_effective_render_size(render):
     scale = render.resolution_percentage / 100.0
     res_x = render.resolution_x * scale * render.pixel_aspect_x
@@ -239,7 +325,7 @@ def get_effective_f_pixels(f_mm, sensor_width_mm, sensor_height_mm, sensor_fit, 
         else:
              return (f_mm / sensor_height_mm) * pixel_height
 
-def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None, anchor_location=None):
+def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None, anchor_location=None, anchor_screen_offset=None):
     """
     vp_data: {'X':(u,v), ...} 以中心像素为单位
     axis_weights: {'X': count, ...} 各轴的线段数量权重
@@ -474,9 +560,14 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
     rot_matrix = mathutils.Matrix(R_ortho.T)
     
     # 5. 位置 (轨道)
+    target_px = 0.0 - principal_point[0]
+    target_py = 0.0 - principal_point[1]
+    if anchor_screen_offset is not None:
+        target_px, target_py = anchor_screen_offset
+
     ray_cam = np.array([
-        0.0 - principal_point[0],
-        0.0 - principal_point[1],
+        target_px,
+        target_py,
         -f_pixels
     ])
     ray_cam = ray_cam / np.linalg.norm(ray_cam) 
