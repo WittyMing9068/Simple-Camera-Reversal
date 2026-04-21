@@ -2,7 +2,10 @@ import bpy
 import numpy as np
 import mathutils
 import bpy_extras
-from . import utils
+from . import utils, properties
+
+
+HORIZON_LOCK_THRESHOLD_PX = 8.0
 
 
 def solve_camera_core(context):
@@ -19,71 +22,41 @@ def solve_camera_core(context):
 
     render = scene.render
     pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
-    cx = pixel_res_x * 0.5
-    cy = pixel_res_y * 0.5
 
     # 1. 准备数据
-    lines_data = {'X': [], 'Y': [], 'Z': []}
+    lines_data, vp_data_raw, vp_data, axis_weights, horizon_data = utils.solve_horizon_data(
+        lines,
+        pixel_res_x,
+        pixel_res_y,
+        scene.cmp_data.horizon_enabled,
+        scene.cmp_data.horizon_offset_px,
+    )
 
-    for line in lines:
-        u1, v1 = line.start
-        u2, v2 = line.end
+    active_axes = [axis for axis in ('X', 'Y', 'Z') if len(lines_data.get(axis, [])) >= 1]
+    if len(active_axes) < 1:
+        iface_ = bpy.app.translations.pgettext_iface
+        return False, iface_("Requires at least one axis (min 1 line per axis)")
 
-        px1 = u1 * pixel_res_x - cx
-        py1 = v1 * pixel_res_y - cy
-        px2 = u2 * pixel_res_x - cx
-        py2 = v2 * pixel_res_y - cy
-
-        dx = px2 - px1
-        dy = py2 - py1
-        length = np.hypot(dx, dy)
-
-        if length < 10:
-            continue
-
-        a = -dy / length
-        b = dx / length
-        c = -(a * px1 + b * py1)
-
-        lines_data[line.axis].append([a, b, c, length])
+    perspective_constraints = utils.build_perspective_mode_constraints(
+        lines_data,
+        pixel_res_x,
+        pixel_res_y,
+        finite_vp_axes=list(vp_data_raw.keys()),
+    )
 
     # 保留当前的旋转微调状态，并在新解算结果上重新应用
     current_world_rotation = scene.cmp_data.world_rotation
     current_flip_z = scene.cmp_data.flip_z_axis
     current_shift_x = cam.data.shift_x
     current_shift_y = cam.data.shift_y
-
-    # 2. 求解消失点 (VPs)
-    vp_data = {}
-    axis_weights = {}
-
-    for axis in ['X', 'Y', 'Z']:
-        data = lines_data[axis]
-        count = len(data)
-        axis_weights[axis] = count
-
-        if count >= 2:
-            arr = np.array(data)
-            lines_abc = arr[:, :3]
-            weights = arr[:, 3]
-
-            # 当只有2条线时，使用均匀权重（所有权重=1）
-            # 因为2条线时线长度差异可能导致权重不平衡，从而产生不稳定的消失点
-            if count == 2:
-                weights = np.ones(count)
-
-            image_diag = np.hypot(pixel_res_x, pixel_res_y)
-            vp = utils.solve_vanishing_point_2d(lines_abc, weights, image_diag=image_diag)
-            if vp is not None:
-                vp_data[axis] = vp
-
-    # 3. 求解相机参数（渐进式解算）
     cursor_location = scene.cursor.location.copy()
     current_dist = (cam.location - cursor_location).length
     if current_dist < 0.1: current_dist = 10.0
 
     anchor_screen_offset = None
     target_cursor_uv = None
+    horizon_target_uv = None
+    horizon_lock_active = False
     try:
         cursor_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
 
@@ -102,6 +75,20 @@ def solve_camera_core(context):
                 float((cursor_view.x - principal_u) * pixel_res_x),
                 float((cursor_view.y - principal_v) * pixel_res_y),
             )
+
+            if scene.cmp_data.horizon_enabled and horizon_data is not None:
+                cursor_px = utils.uv_to_centered_px(target_cursor_uv, pixel_res_x, pixel_res_y)
+                dist_to_horizon = abs(utils.signed_distance_to_line_2d(cursor_px, horizon_data['line']))
+                if dist_to_horizon <= HORIZON_LOCK_THRESHOLD_PX:
+                    proj_px = utils.project_point_to_line_2d(cursor_px, horizon_data['point'], horizon_data['direction'])
+                    horizon_target_uv = utils.centered_px_to_uv(proj_px, pixel_res_x, pixel_res_y)
+
+                    proj_offset = (
+                        float((horizon_target_uv[0] - principal_u) * pixel_res_x),
+                        float((horizon_target_uv[1] - principal_v) * pixel_res_y),
+                    )
+                    anchor_screen_offset = proj_offset
+                    horizon_lock_active = True
     except Exception:
         anchor_screen_offset = None
 
@@ -110,71 +97,183 @@ def solve_camera_core(context):
     shift_x = 0.0
     shift_y = 0.0
     loc_orbit = None
+    solve_mode_hint_key = None
 
-    # 渐进式解算：优先使用最可靠的解算方法
-    if len(vp_data) >= 2:
+    def solve_strict_mode(
+        lines_for_solve,
+        f_seed_mm,
+        hint_refined_key,
+        hint_locked_key,
+        allow_focal_refine=True,
+        hint_fixed_key=None,
+        rot_seed=None,
+    ):
         try:
-            f_mm, rot_matrix, shift_x, shift_y, loc_orbit = utils.calculate_camera_transform(
-                vp_data,
+            rot_init = rot_seed if rot_seed is not None else cam.matrix_world.to_3x3()
+            strict_result = utils.solve_strict_mode_constrained(
+                lines_for_solve,
+                f_seed_mm,
                 cam.data.sensor_width,
                 cam.data.sensor_height,
                 cam.data.sensor_fit,
-                pixel_res_x, pixel_res_y, current_dist,
-                default_f_mm=cam.data.lens,
-                axis_weights=axis_weights,
-                anchor_location=cursor_location,
-                anchor_screen_offset=anchor_screen_offset,
+                pixel_res_x,
+                pixel_res_y,
+                rot_init,
+                allow_focal_refine=allow_focal_refine,
             )
-        except Exception as e:
-            print(f"[CameraMatch] Full solve failed: {e}")
-            f_mm = None
+            if not strict_result.get('ok', False):
+                return None
 
-    # 回退方案：如果完整解算失败，尝试单线模式
-    if f_mm is None or rot_matrix is None:
-        active_axes = [a for a in ['X', 'Y', 'Z'] if len(lines_data[a]) >= 1]
+            f_val = float(strict_result.get('f_mm', f_seed_mm))
+            rot_val = strict_result.get('rot_matrix')
+            if rot_val is None:
+                return None
 
-        if len(active_axes) < 2:
-            iface_ = bpy.app.translations.pgettext_iface
-            return False, iface_("Requires at least two axes with valid lines")
-
-        try:
-            f_mm = cam.data.lens
-            shift_x = 0.0
-            shift_y = 0.0
-
-            f_pixels = utils.get_effective_f_pixels(
-                f_mm,
+            f_pixels_val = utils.get_effective_f_pixels(
+                f_val,
                 cam.data.sensor_width,
                 cam.data.sensor_height,
                 cam.data.sensor_fit,
-                pixel_res_x, pixel_res_y
+                pixel_res_x,
+                pixel_res_y,
             )
-
-            rot_matrix = utils.solve_camera_rotation_constrained(
-                lines_data, f_pixels, cam.matrix_world.to_3x3()
-            )
-
-            if rot_matrix is None:
-                iface_ = bpy.app.translations.pgettext_iface
-                return False, iface_("Rotation solving failed. Try drawing more lines.")
+            if not np.isfinite(f_pixels_val) or f_pixels_val <= 1e-8:
+                return None
 
             target_px, target_py = (0.0, 0.0)
             if anchor_screen_offset is not None:
                 target_px, target_py = anchor_screen_offset
 
-            ray_cam = np.array([target_px, target_py, -f_pixels])
+            ray_cam = np.array([target_px, target_py, -f_pixels_val])
             ray_cam /= np.linalg.norm(ray_cam)
             p_org_cam = ray_cam * current_dist
+            loc_val = cursor_location - (rot_val @ mathutils.Vector(p_org_cam))
 
-            loc_orbit = cursor_location - (rot_matrix @ mathutils.Vector(p_org_cam))
+            focal_state = strict_result.get('focal_state', 'locked')
+            if focal_state == 'refined':
+                hint_key = hint_refined_key
+            elif focal_state == 'fixed' and hint_fixed_key is not None:
+                hint_key = hint_fixed_key
+            else:
+                hint_key = hint_locked_key
 
-            iface_ = bpy.app.translations.pgettext_iface
-            print(f"[CameraMatch] Using fallback mode (single-line)")
-
+            return {
+                'f_mm': f_val,
+                'rot_matrix': rot_val,
+                'shift_x': 0.0,
+                'shift_y': 0.0,
+                'loc_orbit': loc_val,
+                'hint_key': hint_key,
+                'strict_result': strict_result,
+            }
         except Exception as e:
-            print(f"[CameraMatch] Fallback solve failed: {e}")
-            iface_ = bpy.app.translations.pgettext_iface
+            print(f"[CameraMatch] Strict solve failed: {e}")
+            return None
+
+    iface_ = bpy.app.translations.pgettext_iface
+
+    solve_mode = perspective_constraints.get('mode', 'INSUFFICIENT')
+    guided_lines_data = perspective_constraints.get('guided_lines_data', lines_data)
+
+    if solve_mode == 'ONE_POINT':
+        strict_solution = solve_strict_mode(
+            guided_lines_data,
+            cam.data.lens,
+            "Constrained solve: focal refined",
+            "Constrained solve: focal locked (insufficient constraints)",
+            allow_focal_refine=False,
+            hint_fixed_key="One-point strict: focal fixed",
+        )
+        if strict_solution is None:
             return False, iface_("Solving failed. Check line placement.")
+
+        f_mm = strict_solution['f_mm']
+        rot_matrix = strict_solution['rot_matrix']
+        shift_x = strict_solution['shift_x']
+        shift_y = strict_solution['shift_y']
+        loc_orbit = strict_solution['loc_orbit']
+        solve_mode_hint_key = strict_solution['hint_key']
+
+    else:
+        vp_for_full_solve = dict(vp_data)
+        if len(vp_for_full_solve) >= 2:
+            try:
+                solve_axis_weights = {axis: axis_weights.get(axis, 0) for axis in vp_for_full_solve.keys()}
+                f_mm, rot_matrix, shift_x, shift_y, loc_orbit = utils.calculate_camera_transform(
+                    vp_for_full_solve,
+                    cam.data.sensor_width,
+                    cam.data.sensor_height,
+                    cam.data.sensor_fit,
+                    pixel_res_x, pixel_res_y, current_dist,
+                    default_f_mm=cam.data.lens,
+                    axis_weights=solve_axis_weights,
+                    anchor_location=cursor_location,
+                    anchor_screen_offset=anchor_screen_offset,
+                )
+            except Exception as e:
+                print(f"[CameraMatch] Hybrid full solve failed: {e}")
+                f_mm = None
+
+        if f_mm is not None and rot_matrix is not None:
+            strict_post = solve_strict_mode(
+                lines_data,
+                f_mm,
+                "Constrained solve: focal refined",
+                "Constrained solve: focal locked (insufficient constraints)",
+                allow_focal_refine=True,
+                rot_seed=rot_matrix,
+            )
+            if strict_post is not None:
+                strict_result = strict_post.get('strict_result', {})
+                strict_residual = float(strict_result.get('residual', float('inf')))
+
+                hybrid_f_pixels = utils.get_effective_f_pixels(
+                    f_mm,
+                    cam.data.sensor_width,
+                    cam.data.sensor_height,
+                    cam.data.sensor_fit,
+                    pixel_res_x,
+                    pixel_res_y,
+                )
+                hybrid_residual = utils.compute_rotation_constraint_residual(lines_data, rot_matrix, hybrid_f_pixels)
+                improvement = hybrid_residual - strict_residual
+                improved_enough = (
+                    np.isfinite(hybrid_residual)
+                    and np.isfinite(strict_residual)
+                    and (
+                        strict_residual <= hybrid_residual * 0.985
+                        or improvement >= 0.0015
+                        or (
+                            strict_result.get('focal_state') == 'refined'
+                            and strict_residual <= hybrid_residual + 0.001
+                        )
+                    )
+                )
+
+                if improved_enough:
+                    f_mm = strict_post['f_mm']
+                    rot_matrix = strict_post['rot_matrix']
+                    shift_x = strict_post['shift_x']
+                    shift_y = strict_post['shift_y']
+                    loc_orbit = strict_post['loc_orbit']
+                    solve_mode_hint_key = strict_post['hint_key']
+
+        if f_mm is None or rot_matrix is None:
+            strict_solution = solve_strict_mode(
+                lines_data,
+                cam.data.lens,
+                "Constrained solve: focal refined",
+                "Constrained solve: focal locked (insufficient constraints)",
+            )
+            if strict_solution is None:
+                return False, iface_("Solving failed. Check line placement.")
+
+            f_mm = strict_solution['f_mm']
+            rot_matrix = strict_solution['rot_matrix']
+            shift_x = strict_solution['shift_x']
+            shift_y = strict_solution['shift_y']
+            loc_orbit = strict_solution['loc_orbit']
+            solve_mode_hint_key = strict_solution['hint_key']
 
     # 稳定性检查
     if f_mm is None:
@@ -231,6 +330,7 @@ def solve_camera_core(context):
     # 4. 应用
     view_state = utils.capture_camera_view_state(context)
     try:
+        properties.suppress_horizon_updates()
         cam.data.lens = f_mm
         cam.data.shift_x = shift_x
         cam.data.shift_y = shift_y
@@ -240,7 +340,11 @@ def solve_camera_core(context):
         cam.matrix_world = mathutils.Matrix.Translation(loc_orbit) @ new_rot_4x4
         context.view_layer.update()
 
-        if target_cursor_uv is not None:
+        target_uv_for_shift = target_cursor_uv
+        if horizon_lock_active and horizon_target_uv is not None:
+            target_uv_for_shift = horizon_target_uv
+
+        if target_uv_for_shift is not None:
             try:
                 shift_eps = 1e-4
                 max_shift_step = 0.02
@@ -250,8 +354,8 @@ def solve_camera_core(context):
                     if not (np.isfinite(cur_view.x) and np.isfinite(cur_view.y)):
                         break
 
-                    err_u = target_cursor_uv[0] - float(cur_view.x)
-                    err_v = target_cursor_uv[1] - float(cur_view.y)
+                    err_u = target_uv_for_shift[0] - float(cur_view.x)
+                    err_v = target_uv_for_shift[1] - float(cur_view.y)
                     err_px = np.hypot(err_u * pixel_res_x, err_v * pixel_res_y)
                     if err_px < 0.25:
                         break
@@ -309,8 +413,8 @@ def solve_camera_core(context):
                         context.view_layer.update()
                         break
 
-                    new_err_u = target_cursor_uv[0] - float(new_view.x)
-                    new_err_v = target_cursor_uv[1] - float(new_view.y)
+                    new_err_u = target_uv_for_shift[0] - float(new_view.x)
+                    new_err_v = target_uv_for_shift[1] - float(new_view.y)
                     new_err_px = np.hypot(new_err_u * pixel_res_x, new_err_v * pixel_res_y)
                     if (not np.isfinite(new_err_px)) or new_err_px >= err_px:
                         cam.data.shift_x = base_shift_x
@@ -325,7 +429,6 @@ def solve_camera_core(context):
             except Exception as e:
                 print(f"[CameraMatch] Cursor lock correction failed: {e}")
 
-        utils.restore_camera_view_state(view_state)
         scene.cmp_data.last_world_rotation = 0.0
         scene.cmp_data.last_flip_z = False
         scene.cmp_data.world_rotation = 0.0
@@ -337,13 +440,22 @@ def solve_camera_core(context):
             scene.cmp_data.flip_z_axis = current_flip_z
 
         iface_ = bpy.app.translations.pgettext_iface
-        msg = iface_("Success: ") + f"f={f_mm:.1f}mm," + iface_(" Shift=") + f"({shift_x:.2f}, {shift_y:.2f})"
+        mode_hint = ""
+        if solve_mode_hint_key:
+            mode_hint = " " + iface_(solve_mode_hint_key)
+
+        msg = iface_("Success: ") + f"f={f_mm:.1f}mm," + iface_(" Shift=") + f"({shift_x:.2f}, {shift_y:.2f})" + mode_hint
         return True, msg
 
     except Exception as e:
         print(f"[CameraMatch] Apply transform failed: {e}")
         iface_ = bpy.app.translations.pgettext_iface
         return False, iface_("Failed to apply camera transform")
+    finally:
+        properties.resume_horizon_updates()
+        properties.reset_horizon_solve_state()
+        utils.restore_camera_view_state(view_state)
+
 
 class CMP_OT_MatchCamera(bpy.types.Operator):
     """Solve camera based on drawn lines"""
@@ -362,8 +474,10 @@ class CMP_OT_MatchCamera(bpy.types.Operator):
             self.report({'WARNING'}, msg)
             return {'CANCELLED'}
 
+
 def register():
     utils.register_class_safe(CMP_OT_MatchCamera)
+
 
 def unregister():
     utils.unregister_class_safe(CMP_OT_MatchCamera)

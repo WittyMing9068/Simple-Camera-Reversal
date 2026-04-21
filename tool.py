@@ -1,11 +1,14 @@
+import math
+import mathutils
 import bpy
 import sys
+import time
 import numpy as np
 import bpy_extras
 from mathutils import Vector
 from bpy_extras import view3d_utils
 
-from . import utils
+from . import utils, properties
 
 
 class CMP_OT_DrawLine(bpy.types.Operator):
@@ -19,6 +22,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
     STATE_EDITING = 'EDITING'
     STATE_DRAGGING = 'DRAGGING'
     STATE_WAITING_DRAG = 'WAITING_DRAG'
+    STATE_DRAG_HORIZON_OFFSET = 'DRAG_HORIZON_OFFSET'
 
     state = STATE_IDLE
     current_axis = 'X'
@@ -26,6 +30,9 @@ class CMP_OT_DrawLine(bpy.types.Operator):
     drag_start_x = 0
     drag_start_y = 0
     DRAG_THRESHOLD = 10
+    SOLVE_INTERVAL = 1.0 / 28.0
+    HORIZON_HANDLE_RADIUS = 14.0
+    FINE_TUNE_FACTOR = 0.1
 
     def invoke(self, context, event):
         if not context.scene.camera:
@@ -42,6 +49,21 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.undo_stack = []
         self.redo_stack = []
         self.drag_history = None
+        self.last_solve_ts = 0.0
+        self.horizon_drag_start_offset = 0.0
+        self.horizon_drag_start_mouse_render = None
+        self.horizon_drag_shift_state = None
+        self.horizon_drag_updates_suppressed = False
+        self.horizon_drag_start_camera_matrix = None
+        self.horizon_drag_start_f_pixels = None
+        self.horizon_drag_start_normal_render = None
+        self.draw_anchor_norm = None
+        self.draw_anchor_value_norm = None
+        self.draw_shift_state = None
+        self.line_drag_start_mouse_norm = None
+        self.line_drag_start_value_norm = None
+        self.line_drag_shift_state = None
+        self.draw_axis_constraint = None
 
         cmp_data = context.scene.cmp_data
         cmp_data.active_index = -1
@@ -77,7 +99,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             cols = {'X': iface_('Red X'), 'Y': iface_('Green Y'), 'Z': iface_('Blue Z')}
             c = cols.get(self.current_axis, "")
             mod = self.primary_modifier_label()
-            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | %s+Z undo | %s+Shift+Z redo | Alt+X clear all | Esc / Right click exit") % (c, mod, mod)
+            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Shift fine tune | Draw: X lock horizontal / Y lock vertical (toggle) | %s+Z undo | %s+Shift+Z redo | Alt+X clear all | Esc / Right click exit") % (c, mod, mod)
 
             if context.scene.cmp_data.lines_camera is not None and context.scene.cmp_data.lines_camera != context.scene.camera:
                 camera_hint = iface_(" | Camera changed: press Alt+X to clear old guides")
@@ -92,6 +114,68 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         except Exception:
             pass
 
+    def apply_draw_axis_constraint(self, start_norm, end_norm):
+        if start_norm is None or end_norm is None:
+            return end_norm
+        if self.draw_axis_constraint == 'X':
+            return Vector((float(end_norm[0]), float(start_norm[1])))
+        if self.draw_axis_constraint == 'Y':
+            return Vector((float(start_norm[0]), float(end_norm[1])))
+        return end_norm
+
+    def resolve_dragged_point(self, context, x, y, anchor_mouse_norm, anchor_value_norm, use_fine_tune=False):
+        norm = self.screen_to_norm(context, x, y)
+        if norm is None:
+            return None
+        if not use_fine_tune or anchor_mouse_norm is None or anchor_value_norm is None:
+            return norm
+        dx = float(norm[0]) - float(anchor_mouse_norm[0])
+        dy = float(norm[1]) - float(anchor_mouse_norm[1])
+        return Vector((
+            float(anchor_value_norm[0]) + dx * self.FINE_TUNE_FACTOR,
+            float(anchor_value_norm[1]) + dy * self.FINE_TUNE_FACTOR,
+        ))
+
+    def refresh_drawing_endpoint(self, context, x, y, use_fine_tune=False):
+        lines = context.scene.cmp_data.lines
+        if not lines:
+            return
+        start = lines[-1].start
+        end = self.resolve_dragged_point(
+            context,
+            x,
+            y,
+            self.draw_anchor_norm,
+            self.draw_anchor_value_norm,
+            use_fine_tune=use_fine_tune,
+        )
+        if end is None:
+            return
+        end = self.apply_draw_axis_constraint(start, end)
+        lines[-1].end = end
+        self.trigger_solve(context)
+
+    def refresh_dragging_endpoint(self, context, x, y, idx, use_fine_tune=False):
+        lines = context.scene.cmp_data.lines
+        if idx == -1 or idx >= len(lines):
+            return
+        line = lines[idx]
+        point = self.resolve_dragged_point(
+            context,
+            x,
+            y,
+            self.line_drag_start_mouse_norm,
+            self.line_drag_start_value_norm,
+            use_fine_tune=use_fine_tune,
+        )
+        if point is None:
+            return
+        if self.active_handle == 0:
+            line.start = point
+        else:
+            line.end = point
+        self.trigger_solve(context)
+
     def modal(self, context, event):
         context.area.tag_redraw()
 
@@ -101,6 +185,16 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
             return {'PASS_THROUGH'}
+
+        cmp_data = context.scene.cmp_data
+        
+        # 实现在绘制模式下切换相机时，自动进行数据清理和重绑，彻底告别报错弹窗
+        if cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
+            self.clear_all_lines(context, push_history=False, run_solve=False)
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.last_error = ""
+            self.update_header(context)
 
         if not utils.is_camera_view(context):
             self.last_error = "Please stay in Camera View while drawing"
@@ -129,6 +223,16 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             elif event.type in {'THREE', 'NUMPAD_3'}:
                 self.current_axis = 'Z'
                 self.update_header(context)
+            elif event.type in {'X', 'Y'} and self.state in {self.STATE_DRAWING, self.STATE_WAITING_DRAG}:
+                target = event.type
+                self.draw_axis_constraint = None if self.draw_axis_constraint == target else target
+                if self.state == self.STATE_DRAWING:
+                    self.refresh_drawing_endpoint(
+                        context,
+                        event.mouse_region_x,
+                        event.mouse_region_y,
+                        use_fine_tune=bool(event.shift),
+                    )
             elif event.type == 'X':
                 if self.state == self.STATE_EDITING:
                     lines = context.scene.cmp_data.lines
@@ -136,6 +240,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                     if 0 <= idx < len(lines):
                         self.push_history(context)
                         lines.remove(idx)
+                        self.reset_horizon_manual_offset(context)
                         context.scene.cmp_data.active_index = -1
                         self.state = self.STATE_IDLE
                         self.trigger_solve(context)
@@ -146,29 +251,42 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
         if event.type == 'MOUSEMOVE':
             if self.state == self.STATE_DRAWING:
-                norm = self.screen_to_norm(context, x, y)
-                if norm and lines:
-                    lines[-1].end = norm
-                    self.trigger_solve(context)
+                if self.draw_shift_state is None:
+                    self.draw_shift_state = bool(event.shift)
+                elif bool(event.shift) != self.draw_shift_state:
+                    self.draw_shift_state = bool(event.shift)
+                    anchor = self.screen_to_norm(context, x, y)
+                    if anchor is not None and lines:
+                        self.draw_anchor_norm = anchor
+                        self.draw_anchor_value_norm = Vector(lines[-1].end)
+                self.refresh_drawing_endpoint(context, x, y, use_fine_tune=bool(event.shift))
             elif self.state == self.STATE_DRAGGING:
-                norm = self.screen_to_norm(context, x, y)
-                if norm and idx != -1:
-                    line = lines[idx]
-                    if self.active_handle == 0:
-                        line.start = norm
-                    else:
-                        line.end = norm
-                    self.trigger_solve(context)
+                if self.line_drag_shift_state is None:
+                    self.line_drag_shift_state = bool(event.shift)
+                elif bool(event.shift) != self.line_drag_shift_state:
+                    self.line_drag_shift_state = bool(event.shift)
+                    anchor = self.screen_to_norm(context, x, y)
+                    if anchor is not None and idx != -1 and idx < len(lines):
+                        self.line_drag_start_mouse_norm = anchor
+                        line = lines[idx]
+                        self.line_drag_start_value_norm = Vector(line.start if self.active_handle == 0 else line.end)
+                self.refresh_dragging_endpoint(context, x, y, idx, use_fine_tune=bool(event.shift))
+            elif self.state == self.STATE_DRAG_HORIZON_OFFSET:
+                self.update_horizon_drag(context, x, y, event_shift=bool(event.shift))
             elif self.state == self.STATE_WAITING_DRAG:
                 dist = np.hypot(x - self.drag_start_x, y - self.drag_start_y)
                 if dist > self.DRAG_THRESHOLD:
                     self.start_drawing(context, self.drag_start_x, self.drag_start_y)
-                    norm = self.screen_to_norm(context, x, y)
-                    if norm and lines:
-                        lines[-1].end = norm
-                        self.trigger_solve(context)
+                    self.draw_shift_state = bool(event.shift)
+                    self.refresh_drawing_endpoint(context, x, y, use_fine_tune=bool(event.shift))
 
         elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            if self.state in {self.STATE_IDLE, self.STATE_EDITING}:
+                horizon_handle = self.check_horizon_handle_click(context, x, y)
+                if horizon_handle is not None:
+                    self.begin_horizon_drag(context, horizon_handle, x, y)
+                    return {'RUNNING_MODAL'}
+
             if self.state == self.STATE_IDLE:
                 dot = self.check_dot_click(context, x, y)
                 if dot != -1:
@@ -178,12 +296,19 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                     self.drag_start_x = x
                     self.drag_start_y = y
                     self.state = self.STATE_WAITING_DRAG
+                    self.draw_axis_constraint = None
             elif self.state == self.STATE_EDITING:
                 h = self.check_endpoint_click(context, x, y, idx)
                 if h != -1:
                     self.active_handle = h
                     self.begin_drag_history(context, idx)
+                    self.reset_horizon_manual_offset(context)
                     self.state = self.STATE_DRAGGING
+                    self.line_drag_shift_state = bool(event.shift)
+                    self.line_drag_start_mouse_norm = self.screen_to_norm(context, x, y)
+                    if idx != -1 and idx < len(lines):
+                        line = lines[idx]
+                        self.line_drag_start_value_norm = Vector(line.start if h == 0 else line.end)
                 else:
                     dot = self.check_dot_click(context, x, y)
                     if dot != -1:
@@ -197,124 +322,409 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 self.state = self.STATE_IDLE
                 context.scene.cmp_data.active_index = -1
                 context.scene.cmp_data.is_creating_line = False
-                self.trigger_solve(context)
+                self.draw_axis_constraint = None
+                self.draw_anchor_norm = None
+                self.draw_anchor_value_norm = None
+                self.draw_shift_state = None
+                self.trigger_solve(context, force=True)
             elif self.state == self.STATE_WAITING_DRAG:
                 self.state = self.STATE_IDLE
                 context.scene.cmp_data.active_index = -1
+                self.draw_axis_constraint = None
             elif self.state == self.STATE_DRAGGING:
                 self.finish_drag_history(context)
                 self.state = self.STATE_EDITING
-                self.trigger_solve(context)
+                self.line_drag_start_mouse_norm = None
+                self.line_drag_start_value_norm = None
+                self.line_drag_shift_state = None
+                self.trigger_solve(context, force=True)
+            elif self.state == self.STATE_DRAG_HORIZON_OFFSET:
+                self.finish_drag_history(context)
+                self.state = self.STATE_IDLE
+                self.horizon_drag_shift_state = None
+                self.end_horizon_drag_updates()
 
         return {'RUNNING_MODAL'}
 
+    def get_horizon_geometry(self, context):
+        cmp_data = getattr(context.scene, "cmp_data", None)
+        if cmp_data is None or not cmp_data.horizon_enabled:
+            return None
+        if len(cmp_data.lines) < 2:
+            return None
+
+        render = context.scene.render
+        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+        return utils.compute_horizon_overlay_geometry(
+            cmp_data.lines,
+            cmp_data,
+            pixel_res_x,
+            pixel_res_y,
+            context.region.width,
+            context.region.height,
+            context=context,
+        )
+
+
+    def check_horizon_handle_click(self, context, x, y):
+        geo = self.get_horizon_geometry(context)
+        if geo is None:
+            return None
+
+        mouse = np.array([float(x), float(y)], dtype=float)
+        offset_handle = np.array(geo['offset_handle_region'], dtype=float)
+
+        if np.linalg.norm(mouse - offset_handle) <= self.HORIZON_HANDLE_RADIUS:
+            return 'OFFSET'
+        return None
+
+    def begin_horizon_drag(self, context, handle, x, y):
+        geo = self.get_horizon_geometry(context)
+        if geo is None:
+            return
+
+        cmp_data = context.scene.cmp_data
+        render = context.scene.render
+        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+
+        self.horizon_drag_start_offset = float(cmp_data.horizon_offset_px)
+        self.drag_history = self.state_to_snapshot(context)
+
+        if handle != 'OFFSET':
+            return
+
+        self.state = self.STATE_DRAG_HORIZON_OFFSET
+        self.horizon_drag_start_mouse_render = utils.region_xy_to_render_centered_px(
+            (float(x), float(y)),
+            pixel_res_x,
+            pixel_res_y,
+            context.region.width,
+            context.region.height,
+        )
+        start_normal = np.array(geo['horizon']['normal'], dtype=float)
+        start_normal_norm = np.linalg.norm(start_normal)
+        if start_normal_norm > 1e-8:
+            start_normal = start_normal / start_normal_norm
+            self.horizon_drag_start_normal_render = start_normal
+        else:
+            self.horizon_drag_start_normal_render = np.array([0.0, 1.0], dtype=float)
+
+        if not self.horizon_drag_updates_suppressed:
+            properties.suppress_horizon_updates()
+            self.horizon_drag_updates_suppressed = True
+        self.horizon_drag_start_camera_matrix = context.scene.camera.matrix_world.copy()
+        self.horizon_drag_start_f_pixels = utils.get_effective_f_pixels(
+            context.scene.camera.data.lens,
+            context.scene.camera.data.sensor_width,
+            context.scene.camera.data.sensor_height,
+            context.scene.camera.data.sensor_fit,
+            pixel_res_x,
+            pixel_res_y,
+        )
+
+        context.scene.cmp_data.active_index = -1
+
+    def update_horizon_drag(self, context, x, y, event_shift=False):
+        if self.state != self.STATE_DRAG_HORIZON_OFFSET:
+            return
+
+        cmp_data = context.scene.cmp_data
+        use_fine_tune = bool(event_shift)
+
+        if self.horizon_drag_shift_state is None:
+            self.horizon_drag_shift_state = use_fine_tune
+        elif use_fine_tune != self.horizon_drag_shift_state:
+            self.horizon_drag_shift_state = use_fine_tune
+            render = context.scene.render
+            pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+            mouse_render = utils.region_xy_to_render_centered_px(
+                (float(x), float(y)),
+                pixel_res_x,
+                pixel_res_y,
+                context.region.width,
+                context.region.height,
+            )
+            self.horizon_drag_start_mouse_render = mouse_render
+            self.horizon_drag_start_offset = float(cmp_data.horizon_offset_px)
+
+        render = context.scene.render
+        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+
+        mouse_render = utils.region_xy_to_render_centered_px(
+            (float(x), float(y)),
+            pixel_res_x,
+            pixel_res_y,
+            context.region.width,
+            context.region.height,
+        )
+
+        if self.horizon_drag_start_mouse_render is None:
+            self.horizon_drag_start_mouse_render = mouse_render
+
+        normal_render = self.horizon_drag_start_normal_render
+        if normal_render is None or len(normal_render) != 2:
+            normal_render = np.array([0.0, 1.0], dtype=float)
+
+        norm_len = np.linalg.norm(normal_render)
+        if norm_len <= 1e-8:
+            normal_render = np.array([0.0, 1.0], dtype=float)
+        else:
+            normal_render = np.array(normal_render, dtype=float) / norm_len
+
+        delta_render = mouse_render - self.horizon_drag_start_mouse_render
+        delta_offset = float(np.dot(delta_render, normal_render))
+        if use_fine_tune:
+            delta_offset *= self.FINE_TUNE_FACTOR
+
+        cmp_data.horizon_offset_px = self.horizon_drag_start_offset + delta_offset
+        self.apply_horizon_drag_camera_preview(context)
+
+    def apply_horizon_drag_camera_preview(self, context):
+        if self.state != self.STATE_DRAG_HORIZON_OFFSET:
+            return
+
+        scene = context.scene
+        cam = scene.camera
+        if cam is None:
+            return
+
+        start_matrix = self.horizon_drag_start_camera_matrix
+        if start_matrix is None:
+            start_matrix = cam.matrix_world.copy()
+            self.horizon_drag_start_camera_matrix = start_matrix.copy()
+
+        render = scene.render
+        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+
+        f_pixels = self.horizon_drag_start_f_pixels
+        if f_pixels is None or not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+            f_pixels = utils.get_effective_f_pixels(
+                cam.data.lens,
+                cam.data.sensor_width,
+                cam.data.sensor_height,
+                cam.data.sensor_fit,
+                pixel_res_x,
+                pixel_res_y,
+            )
+
+        if f_pixels is None or not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+            return
+
+        delta_offset = float(scene.cmp_data.horizon_offset_px - self.horizon_drag_start_offset)
+        if not np.isfinite(delta_offset):
+            return
+
+        delta_pitch = float(np.arctan2(delta_offset, max(float(f_pixels), 1e-8)))
+        if not np.isfinite(delta_pitch):
+            return
+
+        if abs(delta_pitch) <= 1e-9:
+            new_matrix = start_matrix.copy()
+        else:
+            normal_render = self.horizon_drag_start_normal_render
+            if normal_render is not None and len(normal_render) == 2:
+                local_axis = mathutils.Vector((float(normal_render[1]), float(-normal_render[0]), 0.0))
+            else:
+                local_axis = mathutils.Vector((1.0, 0.0, 0.0))
+                
+            rot_axis_world = start_matrix.to_3x3() @ local_axis
+            if rot_axis_world.length > 1e-8:
+                rot_axis_world.normalize()
+            else:
+                rot_axis_world = mathutils.Vector((1.0, 0.0, 0.0))
+                
+            rot_obj = mathutils.Matrix.Rotation(-delta_pitch, 4, rot_axis_world)
+            new_matrix = utils.rotate_matrix_around_point(
+                start_matrix,
+                rot_obj,
+                scene.cursor.location.copy(),
+            )
+
+        view_state = utils.capture_camera_view_state(context)
+        cam.matrix_world = new_matrix
+        context.view_layer.update()
+        utils.restore_camera_view_state(view_state)
+
+    def end_horizon_drag_updates(self):
+        if not self.horizon_drag_updates_suppressed:
+            return
+        self.horizon_drag_updates_suppressed = False
+        self.horizon_drag_start_camera_matrix = None
+        self.horizon_drag_start_f_pixels = None
+        self.horizon_drag_start_mouse_render = None
+        self.horizon_drag_start_normal_render = None
+        self.horizon_drag_shift_state = None
+        properties.resume_horizon_updates()
+
     def line_to_dict(self, line):
         return {
-            'start': tuple(line.start),
-            'end': tuple(line.end),
-            'axis': line.axis,
+            'start': (float(line.start[0]), float(line.start[1])),
+            'end': (float(line.end[0]), float(line.end[1])),
+            'axis': str(line.axis),
         }
 
-    def snapshot_lines(self, context):
-        return [self.line_to_dict(line) for line in context.scene.cmp_data.lines]
+    def state_to_snapshot(self, context):
+        cmp_data = context.scene.cmp_data
+        lines_data = [self.line_to_dict(line) for line in cmp_data.lines]
+        return {
+            'lines': lines_data,
+            'active_index': int(cmp_data.active_index),
+            'lines_camera_name': cmp_data.lines_camera.name if cmp_data.lines_camera is not None else None,
+            'horizon_enabled': bool(cmp_data.horizon_enabled),
+            'horizon_offset_px': float(cmp_data.horizon_offset_px),
+        }
 
     def restore_snapshot(self, context, snapshot):
-        lines = context.scene.cmp_data.lines
-        while len(lines) > 0:
-            lines.remove(len(lines) - 1)
-        for line_data in snapshot:
-            line = lines.add()
-            line.start = line_data['start']
-            line.end = line_data['end']
-            line.axis = line_data['axis']
-        context.scene.cmp_data.active_index = -1
-        self.state = self.STATE_IDLE
-        context.scene.cmp_data.is_creating_line = False
-        self.trigger_solve(context)
+        if snapshot is None:
+            return
+
+        cmp_data = context.scene.cmp_data
+        properties.suppress_horizon_updates()
+        try:
+            cmp_data.lines.clear()
+            for item in snapshot.get('lines', []):
+                line = cmp_data.lines.add()
+                start = item.get('start', (0.0, 0.0))
+                end = item.get('end', (0.0, 0.0))
+                line.start = (float(start[0]), float(start[1]))
+                line.end = (float(end[0]), float(end[1]))
+                line.axis = str(item.get('axis', 'X'))
+
+            line_count = len(cmp_data.lines)
+            active_index = int(snapshot.get('active_index', -1))
+            cmp_data.active_index = active_index if 0 <= active_index < line_count else -1
+
+            cam_name = snapshot.get('lines_camera_name')
+            cmp_data.lines_camera = bpy.data.objects.get(cam_name) if cam_name else None
+
+            cmp_data.horizon_enabled = bool(snapshot.get('horizon_enabled', cmp_data.horizon_enabled))
+            cmp_data.horizon_offset_px = float(snapshot.get('horizon_offset_px', cmp_data.horizon_offset_px))
+        finally:
+            properties.resume_horizon_updates()
 
     def push_history(self, context):
-        self.undo_stack.append(self.snapshot_lines(context))
+        snapshot = self.state_to_snapshot(context)
+        self.undo_stack.append(snapshot)
+        if len(self.undo_stack) > 128:
+            self.undo_stack.pop(0)
         self.redo_stack.clear()
 
     def undo(self, context):
-        current = self.snapshot_lines(context)
         if not self.undo_stack:
             return
-        snapshot = self.undo_stack.pop()
+        current = self.state_to_snapshot(context)
         self.redo_stack.append(current)
+        snapshot = self.undo_stack.pop()
         self.restore_snapshot(context, snapshot)
+        self.trigger_solve(context, force=True)
 
     def redo(self, context):
-        current = self.snapshot_lines(context)
         if not self.redo_stack:
             return
-        snapshot = self.redo_stack.pop()
+        current = self.state_to_snapshot(context)
         self.undo_stack.append(current)
+        snapshot = self.redo_stack.pop()
         self.restore_snapshot(context, snapshot)
+        self.trigger_solve(context, force=True)
 
-    def begin_drag_history(self, context, idx):
-        if 0 <= idx < len(context.scene.cmp_data.lines):
-            self.drag_history = self.snapshot_lines(context)
-        else:
-            self.drag_history = None
+    def begin_drag_history(self, context, _idx=-1):
+        if self.drag_history is None:
+            self.drag_history = self.state_to_snapshot(context)
 
     def finish_drag_history(self, context):
         if self.drag_history is None:
             return
-        current = self.snapshot_lines(context)
+        current = self.state_to_snapshot(context)
         if current != self.drag_history:
             self.undo_stack.append(self.drag_history)
+            if len(self.undo_stack) > 128:
+                self.undo_stack.pop(0)
             self.redo_stack.clear()
         self.drag_history = None
 
+    def reset_horizon_manual_offset(self, context):
+        cmp_data = context.scene.cmp_data
+        if cmp_data.horizon_offset_px != 0.0:
+            cmp_data.horizon_offset_px = 0.0
+
     def clear_all_lines(self, context, push_history=True, run_solve=True):
         cmp_data = context.scene.cmp_data
-        lines = cmp_data.lines
-        if len(lines) == 0:
-            cmp_data.lines_camera = context.scene.camera
-            return
-
-        if push_history:
+        if push_history and (len(cmp_data.lines) > 0 or cmp_data.active_index != -1):
             self.push_history(context)
 
-        while len(lines) > 0:
-            lines.remove(len(lines) - 1)
+        self.reset_horizon_manual_offset(context)
+        
+        # 彻底清理解算相关的旋转与翻转状态，避免残留影响新绘制的线段或新相机
+        cmp_data.last_world_rotation = 0.0
+        cmp_data.world_rotation = 0.0
+        cmp_data.last_flip_z = False
+        cmp_data.flip_z_axis = False
 
-        cmp_data.lines_camera = context.scene.camera
+        cmp_data.lines.clear()
         cmp_data.active_index = -1
-        cmp_data.is_creating_line = False
+        cmp_data.lines_camera = context.scene.camera
+
         self.state = self.STATE_IDLE
-        self.last_error = ""
-        self.update_header(context)
-        context.area.tag_redraw()
+        self.draw_axis_constraint = None
+        self.active_handle = -1
+        self.drag_history = None
+
+        self.draw_anchor_norm = None
+        self.draw_anchor_value_norm = None
+        self.draw_shift_state = None
+        self.line_drag_start_mouse_norm = None
+        self.line_drag_start_value_norm = None
+        self.line_drag_shift_state = None
+
+        self.end_horizon_drag_updates()
 
         if run_solve:
-            self.trigger_solve(context)
+            self.last_error = ""
+            self.update_header(context)
 
     def start_drawing(self, context, x, y):
         norm = self.screen_to_norm(context, x, y)
         if not norm:
             return
         self.push_history(context)
-        l = context.scene.cmp_data.lines.add()
-        l.start = norm
-        l.end = norm
-        l.axis = self.current_axis
+        self.reset_horizon_manual_offset(context)
+        line = context.scene.cmp_data.lines.add()
+        line.start = norm
+        line.end = norm
+        line.axis = self.current_axis
         context.scene.cmp_data.active_index = len(context.scene.cmp_data.lines) - 1
         context.scene.cmp_data.is_creating_line = True
+        self.draw_anchor_norm = Vector(norm)
+        self.draw_anchor_value_norm = Vector(norm)
         self.state = self.STATE_DRAWING
 
-    def trigger_solve(self, context):
+    def should_run_realtime_solve(self, context):
+        cmp_data = context.scene.cmp_data
+        return len(cmp_data.lines) >= 2
+
+    def trigger_solve(self, context, force=False):
         try:
             cmp_data = context.scene.cmp_data
             if cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
-                self.last_error = "Guide lines belong to another camera. Press Alt+X to reset."
-                self.update_header(context)
+                # 保底处理：如果触发了解算时还是另一个相机，这里直接自动重置
+                self.clear_all_lines(context, push_history=False, run_solve=False)
                 return
 
             if len(cmp_data.lines) < 2:
                 self.last_error = ""
                 self.update_header(context)
+                return
+
+            if not force and self.state in {
+                self.STATE_DRAWING,
+                self.STATE_DRAGGING,
+                self.STATE_DRAG_HORIZON_OFFSET,
+            }:
+                if not self.should_run_realtime_solve(context):
+                    return
+
+            now = time.time()
+            if not force and (now - self.last_solve_ts) < self.SOLVE_INTERVAL:
                 return
 
             from . import operators
@@ -323,12 +733,15 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 self.last_error = msg
             else:
                 self.last_error = ""
+            self.last_solve_ts = now
             self.update_header(context)
         except Exception as e:
             print(e)
             pass
 
     def quit(self, context):
+        self.end_horizon_drag_updates()
+
         context.scene.cmp_data.is_drawing_mode = False
         context.scene.cmp_data.is_creating_line = False
 

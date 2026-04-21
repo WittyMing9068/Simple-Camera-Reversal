@@ -1,6 +1,74 @@
 import bpy
+import time
+import numpy as np
+import bpy_extras
 
 from . import utils
+
+
+HORIZON_SOLVE_INTERVAL = 1.0 / 28.0
+_horizon_last_solve_ts = 0.0
+_horizon_timer_registered = False
+_horizon_pending_solve = False
+_horizon_update_suppress_depth = 0
+
+
+def suppress_horizon_updates():
+    global _horizon_update_suppress_depth
+    _horizon_update_suppress_depth += 1
+
+
+def resume_horizon_updates():
+    global _horizon_update_suppress_depth
+    _horizon_update_suppress_depth = max(0, _horizon_update_suppress_depth - 1)
+
+
+def is_horizon_updates_suppressed():
+    return _horizon_update_suppress_depth > 0
+
+
+def reset_horizon_solve_state():
+    global _horizon_last_solve_ts
+    global _horizon_timer_registered
+    global _horizon_pending_solve
+    _horizon_last_solve_ts = 0.0
+    _horizon_timer_registered = False
+    _horizon_pending_solve = False
+
+
+def _solve_horizon_from_context(context):
+    scene = getattr(context, "scene", None)
+    if scene is None or scene.camera is None:
+        return
+
+    if is_horizon_updates_suppressed():
+        return
+
+    cmp_data = getattr(scene, "cmp_data", None)
+    if cmp_data is None or len(cmp_data.lines) < 2:
+        return
+
+    try:
+        from . import operators
+        operators.solve_camera_core(context)
+    except Exception:
+        pass
+
+
+def _horizon_deferred_solve_timer():
+    global _horizon_last_solve_ts
+    global _horizon_timer_registered
+    global _horizon_pending_solve
+
+    _horizon_timer_registered = False
+
+    if not _horizon_pending_solve:
+        return None
+
+    _horizon_pending_solve = False
+    _solve_horizon_from_context(bpy.context)
+    _horizon_last_solve_ts = time.time()
+    return None
 
 
 class CMP_Line(bpy.types.PropertyGroup):
@@ -17,9 +85,145 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
     is_drawing_mode: bpy.props.BoolProperty(default=False)
     is_creating_line: bpy.props.BoolProperty(default=False)
 
-    # 内部变量，用于计算 Delta
     last_world_rotation: bpy.props.FloatProperty(default=0.0)
     last_flip_z: bpy.props.BoolProperty(default=False)
+
+    def _update_view_layer(self):
+        context = bpy.context
+        view_layer = getattr(context, "view_layer", None)
+        if view_layer is None:
+            return
+        try:
+            view_layer.update()
+        except Exception:
+            pass
+
+    def _compensate_shift_for_cursor_uv(self, scene, cam, target_uv):
+        render = scene.render
+        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+        if pixel_res_x <= 1e-8 or pixel_res_y <= 1e-8:
+            return
+
+        cursor_location = scene.cursor.location.copy()
+        shift_eps = 1e-4
+        max_shift_step = 0.02
+
+        for _ in range(3):
+            cur_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+            if not (np.isfinite(cur_view.x) and np.isfinite(cur_view.y)):
+                break
+
+            err_u = target_uv[0] - float(cur_view.x)
+            err_v = target_uv[1] - float(cur_view.y)
+            err_px = np.hypot(err_u * pixel_res_x, err_v * pixel_res_y)
+            if err_px < 0.25:
+                break
+
+            base_shift_x = float(cam.data.shift_x)
+            base_shift_y = float(cam.data.shift_y)
+
+            cam.data.shift_x = base_shift_x + shift_eps
+            self._update_view_layer()
+            view_sx = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+
+            cam.data.shift_x = base_shift_x
+            cam.data.shift_y = base_shift_y + shift_eps
+            self._update_view_layer()
+            view_sy = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+
+            cam.data.shift_y = base_shift_y
+            self._update_view_layer()
+
+            if not (
+                np.isfinite(view_sx.x) and np.isfinite(view_sx.y)
+                and np.isfinite(view_sy.x) and np.isfinite(view_sy.y)
+            ):
+                break
+
+            jac = np.array([
+                [(float(view_sx.x) - float(cur_view.x)) / shift_eps, (float(view_sy.x) - float(cur_view.x)) / shift_eps],
+                [(float(view_sx.y) - float(cur_view.y)) / shift_eps, (float(view_sy.y) - float(cur_view.y)) / shift_eps],
+            ])
+
+            if not np.all(np.isfinite(jac)):
+                break
+
+            try:
+                if np.linalg.cond(jac) > 1e4:
+                    break
+            except Exception:
+                break
+
+            delta, *_ = np.linalg.lstsq(jac, np.array([err_u, err_v]), rcond=None)
+            if not np.all(np.isfinite(delta)):
+                break
+
+            dsx = float(np.clip(delta[0] * 0.7, -max_shift_step, max_shift_step))
+            dsy = float(np.clip(delta[1] * 0.7, -max_shift_step, max_shift_step))
+
+            cam.data.shift_x = base_shift_x + dsx
+            cam.data.shift_y = base_shift_y + dsy
+            self._update_view_layer()
+
+            new_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+            if not (np.isfinite(new_view.x) and np.isfinite(new_view.y)):
+                cam.data.shift_x = base_shift_x
+                cam.data.shift_y = base_shift_y
+                self._update_view_layer()
+                break
+
+            new_err_u = target_uv[0] - float(new_view.x)
+            new_err_v = target_uv[1] - float(new_view.y)
+            new_err_px = np.hypot(new_err_u * pixel_res_x, new_err_v * pixel_res_y)
+            if (not np.isfinite(new_err_px)) or new_err_px >= err_px:
+                cam.data.shift_x = base_shift_x
+                cam.data.shift_y = base_shift_y
+                self._update_view_layer()
+                break
+
+    def get_focal_length_mm(self):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if cam is None:
+            return 50.0
+        return float(cam.data.lens)
+
+    def set_focal_length_mm(self, value):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if scene is None or cam is None:
+            return
+
+        new_lens = float(max(value, 1.0))
+        if not np.isfinite(new_lens):
+            return
+
+        old_lens = float(cam.data.lens)
+        if abs(new_lens - old_lens) < 1e-6:
+            return
+
+        target_uv = None
+        cursor_location = scene.cursor.location.copy()
+        try:
+            cursor_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+            if np.isfinite(cursor_view.x) and np.isfinite(cursor_view.y):
+                target_uv = (float(cursor_view.x), float(cursor_view.y))
+        except Exception:
+            target_uv = None
+
+        context = bpy.context
+        view_state = None
+        if getattr(context, "scene", None) == scene:
+            view_state = utils.capture_camera_view_state(context)
+
+        cam.data.lens = new_lens
+        self._update_view_layer()
+
+        if target_uv is not None:
+            self._compensate_shift_for_cursor_uv(scene, cam, target_uv)
+
+        if view_state is not None and getattr(context, "scene", None) == scene:
+            utils.restore_camera_view_state(view_state)
 
     def update_rotation(self, context):
         import math
@@ -47,6 +251,46 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         context.view_layer.update()
         utils.restore_camera_view_state(view_state)
 
+    def update_horizon(self, context):
+        global _horizon_last_solve_ts
+        global _horizon_timer_registered
+        global _horizon_pending_solve
+
+        if is_horizon_updates_suppressed():
+            return
+
+        scene = getattr(context, "scene", None)
+        if scene is None or scene.camera is None:
+            return
+
+        cmp_data = getattr(scene, "cmp_data", None)
+        if cmp_data is None or len(cmp_data.lines) < 2:
+            return
+
+        now = time.time()
+        elapsed = now - _horizon_last_solve_ts
+
+        if elapsed >= HORIZON_SOLVE_INTERVAL:
+            _horizon_pending_solve = False
+            _solve_horizon_from_context(context)
+            _horizon_last_solve_ts = time.time()
+            return
+
+        _horizon_pending_solve = True
+        if not _horizon_timer_registered:
+            delay = max(0.001, HORIZON_SOLVE_INTERVAL - elapsed)
+            bpy.app.timers.register(_horizon_deferred_solve_timer, first_interval=delay)
+            _horizon_timer_registered = True
+
+    focal_length_mm: bpy.props.FloatProperty(
+        name="Focal Length (mm)",
+        description="Camera focal length in millimeters",
+        min=1.0,
+        max=10000.0,
+        get=get_focal_length_mm,
+        set=set_focal_length_mm,
+    )
+
     world_rotation: bpy.props.FloatProperty(
         name="3D Cursor Rotation",
         description="Rotate camera around 3D cursor",
@@ -64,6 +308,24 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         default=False,
         update=update_rotation
     )
+
+    horizon_enabled: bpy.props.BoolProperty(
+        name="Enable Horizon",
+        description="Enable horizon constraint from X/Y vanishing points",
+        default=True,
+        update=update_horizon
+    )
+
+    horizon_offset_px: bpy.props.FloatProperty(
+        name="Horizon Offset",
+        description="Move horizon up/down in pixel space",
+        default=0.0,
+        soft_min=-2000.0,
+        soft_max=2000.0,
+        update=update_horizon
+    )
+
+
 
 
 def register():
