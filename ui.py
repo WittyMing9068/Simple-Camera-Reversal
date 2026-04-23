@@ -36,6 +36,15 @@ class CMP_PT_MainPanel(bpy.types.Panel):
 
         layout.separator()
 
+        horizon_box = layout.box()
+        horizon_box.label(text="Horizon Constraint", icon='HIDE_OFF')
+        horizon_box.prop(scene.cmp_data, "horizon_enabled", text="Enable Horizon")
+
+        if scene.cmp_data.horizon_enabled:
+            horizon_col = horizon_box.column(align=True)
+
+        layout.separator()
+
         # 3. 说明
         box = layout.box()
         box.label(text="Instructions:", icon='INFO')
@@ -53,7 +62,7 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         # 4. 信息
         if scene.camera:
             col = layout.column(align=True)
-            col.prop(scene.camera.data, "lens", text="Focal Length (mm)")
+            col.prop(scene.cmp_data, "focal_length_mm", text="Focal Length (mm)")
             col.prop(scene.camera.data, "sensor_width", text="Sensor (mm)")
         else:
             layout.alert = True

@@ -1,6 +1,8 @@
 import bpy
+import math
 import numpy as np
 import mathutils
+from bpy_extras import view3d_utils
 
 
 def is_camera_view(context):
@@ -105,6 +107,498 @@ def get_effective_render_size(render):
     return res_x, res_y
 
 
+def uv_to_centered_px(uv, pixel_res_x, pixel_res_y):
+    u, v = uv
+    return np.array([
+        (float(u) - 0.5) * float(pixel_res_x),
+        (float(v) - 0.5) * float(pixel_res_y),
+    ], dtype=float)
+
+
+def centered_px_to_uv(point_px, pixel_res_x, pixel_res_y):
+    x, y = point_px
+    px = float(pixel_res_x) if pixel_res_x else 1.0
+    py = float(pixel_res_y) if pixel_res_y else 1.0
+    return (
+        float(x) / px + 0.5,
+        float(y) / py + 0.5,
+    )
+
+
+def render_centered_px_to_region_xy(point_px, render_res_x, render_res_y, region_w, region_h):
+    u, v = centered_px_to_uv(point_px, render_res_x, render_res_y)
+    return np.array([
+        float(u) * float(region_w),
+        float(v) * float(region_h),
+    ], dtype=float)
+
+
+def region_xy_to_render_centered_px(point_xy, render_res_x, render_res_y, region_w, region_h):
+    rw = float(region_w) if region_w else 1.0
+    rh = float(region_h) if region_h else 1.0
+    u = float(point_xy[0]) / rw
+    v = float(point_xy[1]) / rh
+    return uv_to_centered_px((u, v), render_res_x, render_res_y)
+
+
+def camera_frame_uv_to_world(context, u, v):
+    scene = getattr(context, "scene", None)
+    cam = getattr(scene, "camera", None) if scene is not None else None
+    if cam is None:
+        return None
+
+    TR, TL, BL, BR = get_ordered_frame_points(context)
+    if not TR:
+        return None
+
+    top = TL.lerp(TR, float(u))
+    bot = BL.lerp(BR, float(u))
+    p_loc = bot.lerp(top, float(v))
+    return cam.matrix_world @ p_loc
+
+
+def render_centered_px_to_camera_region_xy(context, point_px, render_res_x, render_res_y):
+    region = getattr(context, "region", None)
+    rv3d = get_camera_view_region_data(context)
+    if region is None or rv3d is None:
+        return None
+
+    uv = centered_px_to_uv(point_px, render_res_x, render_res_y)
+    p_world = camera_frame_uv_to_world(context, uv[0], uv[1])
+    if p_world is None:
+        return None
+
+    p_region = view3d_utils.location_3d_to_region_2d(region, rv3d, p_world)
+    if p_region is None:
+        return None
+
+    return np.array([float(p_region[0]), float(p_region[1])], dtype=float)
+
+
+def build_axis_line_data(lines, pixel_res_x, pixel_res_y):
+    cx = pixel_res_x * 0.5
+    cy = pixel_res_y * 0.5
+    lines_data = {'X': [], 'Y': [], 'Z': []}
+
+    for line in lines:
+        u1, v1 = line.start
+        u2, v2 = line.end
+
+        px1 = u1 * pixel_res_x - cx
+        py1 = v1 * pixel_res_y - cy
+        px2 = u2 * pixel_res_x - cx
+        py2 = v2 * pixel_res_y - cy
+
+        dx = px2 - px1
+        dy = py2 - py1
+        length = np.hypot(dx, dy)
+        if length < 10:
+            continue
+
+        a = -dy / length
+        b = dx / length
+        c = -(a * px1 + b * py1)
+
+        if line.axis in lines_data:
+            lines_data[line.axis].append([a, b, c, length])
+
+    return lines_data
+
+
+def clone_lines_data(lines_data):
+    return {
+        axis: [list(item) for item in lines_data.get(axis, [])]
+        for axis in ('X', 'Y', 'Z')
+    }
+
+
+def build_perspective_mode_constraints(lines_data, pixel_res_x, pixel_res_y, finite_vp_axes=None):
+    counts = {axis: len(lines_data.get(axis, [])) for axis in ('X', 'Y', 'Z')}
+    active_axes = [axis for axis, count in counts.items() if count >= 1]
+    vp_capable_axes = [axis for axis, count in counts.items() if count >= 2]
+
+    axis_order = {'X': 0, 'Y': 1, 'Z': 2}
+    finite_vp_axes = [axis for axis in (finite_vp_axes or []) if axis in axis_order]
+    finite_vp_axes = sorted(set(finite_vp_axes), key=lambda axis: axis_order[axis])
+
+    guided_lines_data = clone_lines_data(lines_data)
+    guided_axes = {}
+    primary_axis = None
+    base_axes = []
+    missing_axis = None
+    mode = 'INSUFFICIENT'
+
+    image_diag = max(float(np.hypot(pixel_res_x, pixel_res_y)), 1.0)
+    guide_length = image_diag * 0.35
+
+    def set_guided_axis(axis, orientation):
+        if orientation == 'VERTICAL':
+            guided_lines_data[axis] = [[1.0, 0.0, 0.0, guide_length]]
+        else:
+            guided_lines_data[axis] = [[0.0, 1.0, 0.0, guide_length]]
+        guided_axes[axis] = orientation
+
+    if len(active_axes) >= 3:
+        mode = 'THREE_POINT'
+        base_axes = ['X', 'Y', 'Z']
+
+    elif len(active_axes) == 2:
+        mode = 'TWO_POINT'
+        if len(finite_vp_axes) >= 2:
+            base_axes = sorted(
+                finite_vp_axes,
+                key=lambda axis: (-counts.get(axis, 0), axis_order[axis]),
+            )[:2]
+        else:
+            base_axes = sorted(active_axes, key=lambda axis: axis_order[axis])
+
+    elif len(active_axes) == 1:
+        mode = 'ONE_POINT'
+        if finite_vp_axes:
+            primary_axis = max(finite_vp_axes, key=lambda axis: (counts.get(axis, 0), -axis_order[axis]))
+        else:
+            primary_axis = active_axes[0]
+        base_axes = [primary_axis]
+
+    if mode == 'TWO_POINT':
+        missing_axis = next((axis for axis in ('X', 'Y', 'Z') if axis not in base_axes), None)
+        missing_orientation_map = {
+            'X': 'HORIZONTAL',
+            'Y': 'VERTICAL',
+            'Z': 'VERTICAL',
+        }
+        if missing_axis is not None:
+            set_guided_axis(missing_axis, missing_orientation_map.get(missing_axis, 'VERTICAL'))
+
+    elif mode == 'ONE_POINT':
+        if primary_axis is None:
+            primary_axis = max(('X', 'Y', 'Z'), key=lambda axis: counts.get(axis, 0))
+
+        one_point_guides = {
+            'X': {'Y': 'VERTICAL', 'Z': 'HORIZONTAL'},
+            'Y': {'X': 'HORIZONTAL', 'Z': 'VERTICAL'},
+            'Z': {'X': 'HORIZONTAL', 'Y': 'VERTICAL'},
+        }
+        for axis in ('X', 'Y', 'Z'):
+            if axis == primary_axis:
+                continue
+            orientation = one_point_guides.get(primary_axis, {}).get(axis, 'VERTICAL')
+            set_guided_axis(axis, orientation)
+
+    return {
+        'mode': mode,
+        'active_axes': active_axes,
+        'base_axes': base_axes,
+        'vp_capable_axes': vp_capable_axes,
+        'finite_vp_axes': finite_vp_axes,
+        'primary_axis': primary_axis,
+        'missing_axis': missing_axis,
+        'guided_axes': guided_axes,
+        'guided_lines_data': guided_lines_data,
+        'counts': counts,
+    }
+
+
+
+def solve_vanishing_points(lines_data, pixel_res_x, pixel_res_y):
+    vp_data = {}
+    axis_weights = {}
+    image_diag = np.hypot(pixel_res_x, pixel_res_y)
+
+    for axis in ['X', 'Y', 'Z']:
+        data = lines_data[axis]
+        count = len(data)
+        axis_weights[axis] = count
+
+        if count < 2:
+            continue
+
+        arr = np.array(data)
+        lines_abc = arr[:, :3]
+        weights = arr[:, 3]
+
+        if count == 2:
+            weights = np.ones(count)
+
+        vp = solve_vanishing_point_2d(lines_abc, weights, image_diag=image_diag)
+        if vp is not None:
+            vp_data[axis] = vp
+
+    return vp_data, axis_weights
+
+
+def rotate_vector_2d(vec, angle_rad):
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return np.array([vec[0] * c - vec[1] * s, vec[0] * s + vec[1] * c], dtype=float)
+
+
+def compute_adjusted_horizon(vp_data, offset_px=0.0):
+    has_x = 'X' in vp_data
+    has_y = 'Y' in vp_data
+
+    if not has_x and not has_y:
+        return None
+
+    if has_x and has_y:
+        vx = np.array(vp_data['X'], dtype=float)
+        vy = np.array(vp_data['Y'], dtype=float)
+        point = (vx + vy) * 0.5
+        direction = vy - vx
+        if np.linalg.norm(direction) <= 1e-8:
+            direction = np.array([1.0, 0.0], dtype=float)
+    elif has_x:
+        vx = np.array(vp_data['X'], dtype=float)
+        point = np.array([0.0, float(vx[1])], dtype=float)
+        direction = np.array([1.0, 0.0], dtype=float)
+    else:
+        vy = np.array(vp_data['Y'], dtype=float)
+        point = np.array([0.0, float(vy[1])], dtype=float)
+        direction = np.array([1.0, 0.0], dtype=float)
+
+    dir_norm = np.linalg.norm(direction)
+    if dir_norm <= 1e-8:
+        direction = np.array([1.0, 0.0], dtype=float)
+    else:
+        direction = direction / dir_norm
+
+
+    normal = np.array([-direction[1], direction[0]], dtype=float)
+    normal_norm = np.linalg.norm(normal)
+    if normal_norm <= 1e-8:
+        normal = np.array([0.0, 1.0], dtype=float)
+    else:
+        normal = normal / normal_norm
+
+    point = point + normal * float(offset_px)
+
+    a, b = normal
+    c = -(a * point[0] + b * point[1])
+
+    return {
+        'point': point,
+        'direction': direction,
+        'normal': normal,
+        'line': np.array([a, b, c], dtype=float),
+    }
+
+
+def project_point_to_line_2d(point, line_point, line_direction):
+    p = np.array(point, dtype=float)
+    p0 = np.array(line_point, dtype=float)
+    d = np.array(line_direction, dtype=float)
+    denom = np.dot(d, d)
+    if denom < 1e-12:
+        return p
+    t = np.dot(p - p0, d) / denom
+    return p0 + d * t
+
+
+def signed_distance_to_line_2d(point, line):
+    p = np.array(point, dtype=float)
+    ln = np.array(line, dtype=float)
+    nrm = np.hypot(ln[0], ln[1])
+    if nrm < 1e-12:
+        return 0.0
+    return float((ln[0] * p[0] + ln[1] * p[1] + ln[2]) / nrm)
+
+
+def solve_horizon_data(lines, pixel_res_x, pixel_res_y, horizon_enabled, horizon_offset_px):
+    lines_data = build_axis_line_data(lines, pixel_res_x, pixel_res_y)
+    vp_raw, axis_weights = solve_vanishing_points(lines_data, pixel_res_x, pixel_res_y)
+    vp_adj, horizon_data = apply_horizon_constraint_to_vps(
+        vp_raw,
+        enabled=horizon_enabled,
+        offset_px=horizon_offset_px,
+    )
+    return lines_data, vp_raw, vp_adj, axis_weights, horizon_data
+
+
+def compute_horizon_overlay_geometry(lines, cmp_data, pixel_res_x, pixel_res_y, region_width, region_height, context=None):
+    _lines_data, vp_raw, _vp_adj, _axis_weights, horizon_data = solve_horizon_data(
+        lines,
+        pixel_res_x,
+        pixel_res_y,
+        True,
+        cmp_data.horizon_offset_px,
+    )
+    if horizon_data is None:
+        return None
+
+    # 计算相机视口中心 (0, 0) 在地平线上的投影作为平均手柄中心点
+    p0 = np.array(horizon_data['point'], dtype=float)
+    dir_vec = np.array(horizon_data['direction'], dtype=float)
+    proj_t = -np.dot(p0, dir_vec)
+    handle_render = p0 + proj_t * dir_vec
+
+    # 计算地平线与图像边界 (-w/2, -h/2) 到 (w/2, h/2) 的交点
+    hw, hh = float(pixel_res_x) * 0.5, float(pixel_res_y) * 0.5
+    valid_ts = []
+    if abs(dir_vec[0]) > 1e-8:
+        t1 = (-hw - p0[0]) / dir_vec[0]
+        y1 = p0[1] + t1 * dir_vec[1]
+        if -hh - 1e-4 <= y1 <= hh + 1e-4: valid_ts.append(t1)
+        
+        t2 = (hw - p0[0]) / dir_vec[0]
+        y2 = p0[1] + t2 * dir_vec[1]
+        if -hh - 1e-4 <= y2 <= hh + 1e-4: valid_ts.append(t2)
+        
+    if abs(dir_vec[1]) > 1e-8:
+        t3 = (-hh - p0[1]) / dir_vec[1]
+        x3 = p0[0] + t3 * dir_vec[0]
+        if -hw - 1e-4 <= x3 <= hw + 1e-4: valid_ts.append(t3)
+        
+        t4 = (hh - p0[1]) / dir_vec[1]
+        x4 = p0[0] + t4 * dir_vec[0]
+        if -hw - 1e-4 <= x4 <= hw + 1e-4: valid_ts.append(t4)
+        
+    if len(valid_ts) >= 2:
+        valid_ts.sort()
+        line_a_render = p0 + valid_ts[0] * dir_vec
+        line_b_render = p0 + valid_ts[-1] * dir_vec
+        draw_line = True
+    else:
+        # 如果地平线完全在画面外，就不画线，但保留手柄
+        line_a_render = handle_render
+        line_b_render = handle_render
+        draw_line = False
+
+    if context is not None:
+        center_region = render_centered_px_to_camera_region_xy(
+            context,
+            horizon_data['point'],
+            pixel_res_x,
+            pixel_res_y,
+        )
+
+        offset_handle_region = render_centered_px_to_camera_region_xy(
+            context,
+            handle_render,
+            pixel_res_x,
+            pixel_res_y,
+        )
+
+        line_a_region = render_centered_px_to_camera_region_xy(
+            context,
+            line_a_render,
+            pixel_res_x,
+            pixel_res_y,
+        )
+        line_b_region = render_centered_px_to_camera_region_xy(
+            context,
+            line_b_render,
+            pixel_res_x,
+            pixel_res_y,
+        )
+
+        if (
+            center_region is not None
+            and offset_handle_region is not None
+            and line_a_region is not None
+            and line_b_region is not None
+        ):
+            dir_region = line_b_region - line_a_region
+            dir_region_norm = np.linalg.norm(dir_region)
+            if dir_region_norm > 1e-8:
+                dir_region = dir_region / dir_region_norm
+                nrm_region = np.array([-dir_region[1], dir_region[0]], dtype=float)
+            else:
+                dir_region = np.array([1.0, 0.0], dtype=float)
+                nrm_region = np.array([0.0, 1.0], dtype=float)
+
+            viewport_center_region = np.array([
+                float(region_width) * 0.5,
+                float(region_height) * 0.5,
+            ], dtype=float)
+
+            return {
+                'horizon': horizon_data,
+                'center_region': center_region,
+                'viewport_center_region': viewport_center_region,
+                'direction_region': dir_region,
+                'normal_region': nrm_region,
+                'line_region_a': line_a_region,
+                'line_region_b': line_b_region,
+                'offset_handle_region': offset_handle_region,
+                'draw_line': draw_line,
+            }
+
+    center_region = render_centered_px_to_region_xy(
+        horizon_data['point'],
+        pixel_res_x,
+        pixel_res_y,
+        region_width,
+        region_height,
+    )
+
+    offset_handle_region = render_centered_px_to_region_xy(
+        handle_render,
+        pixel_res_x,
+        pixel_res_y,
+        region_width,
+        region_height,
+    )
+
+    viewport_center_region = np.array([
+        float(region_width) * 0.5,
+        float(region_height) * 0.5,
+    ], dtype=float)
+
+    line_region_a = render_centered_px_to_region_xy(
+        line_a_render,
+        pixel_res_x,
+        pixel_res_y,
+        region_width,
+        region_height,
+    )
+    line_region_b = render_centered_px_to_region_xy(
+        line_b_render,
+        pixel_res_x,
+        pixel_res_y,
+        region_width,
+        region_height,
+    )
+    dir_region = line_region_b - line_region_a
+    dir_region_norm = np.linalg.norm(dir_region)
+    if dir_region_norm <= 1e-8:
+        dir_region = np.array([1.0, 0.0], dtype=float)
+        nrm_region = np.array([0.0, 1.0], dtype=float)
+    else:
+        dir_region = dir_region / dir_region_norm
+        nrm_region = np.array([-dir_region[1], dir_region[0]], dtype=float)
+
+    return {
+        'horizon': horizon_data,
+        'center_region': center_region,
+        'viewport_center_region': viewport_center_region,
+        'direction_region': dir_region,
+        'normal_region': nrm_region,
+        'line_region_a': line_region_a,
+        'line_region_b': line_region_b,
+        'offset_handle_region': offset_handle_region,
+        'draw_line': draw_line,
+    }
+
+
+
+def apply_horizon_constraint_to_vps(vp_data, enabled=False, offset_px=0.0):
+    if not enabled:
+        return vp_data, None
+
+    horizon = compute_adjusted_horizon(vp_data, offset_px=offset_px)
+    if horizon is None:
+        return vp_data, None
+
+    adjusted = {k: np.array(v, dtype=float) for k, v in vp_data.items()}
+    for axis in ('X', 'Y'):
+        if axis not in adjusted:
+            continue
+        p = adjusted[axis]
+        adjusted[axis] = project_point_to_line_2d(p, horizon['point'], horizon['direction'])
+
+    return adjusted, horizon
+
+
 def distance_point_to_segment_2d(point, start, end):
     point = np.array(point, dtype=float)
     start = np.array(start, dtype=float)
@@ -169,34 +663,7 @@ def get_ordered_frame_points(context):
     return TR, TL, BL, BR
 
 
-def fit_line_2d(points_2d):
-    """
-    拟合 2D 直线: ax + by + c = 0
-    使用 SVD。
-    points_2d: (N, 2) 数组
-    返回 (a, b, c) 归一化向量。
-    """
-    center = np.mean(points_2d, axis=0)
-    uu, dd, vv = np.linalg.svd(points_2d - center)
-    normal = vv[1] # 变异最小的方向即为法线
 
-    a, b = normal
-    c = - (a * center[0] + b * center[1])
-
-    return np.array([a, b, c])
-
-def solve_svd(subset_lines):
-    # subset_lines: (K, 3)
-    if len(subset_lines) < 2: return None
-    try:
-        u, s, vh = np.linalg.svd(subset_lines)
-        v = vh[-1]
-        
-        if abs(v[2]) < 1e-5:
-            return None
-        return v[:2] / v[2]
-    except:
-        return None
 
 def solve_weighted_svd(lines, weights):
     """
@@ -316,14 +783,36 @@ def get_effective_f_pixels(f_mm, sensor_width_mm, sensor_height_mm, sensor_fit, 
         # 通常传感器是 36x24 (3:2 = 1.5)
         # 如果图像是 1920x1080 (16:9 = 1.77) -> 1.77 > 1.5 -> 适配水平
         # 如果图像是 1080x1920 (9:16 = 0.56) -> 0.56 < 1.5 -> 适配垂直
-        
+
         sensor_aspect = sensor_width_mm / sensor_height_mm if sensor_height_mm > 0 else 1.5
         image_aspect = pixel_width / pixel_height if pixel_height > 0 else 1.0
-        
+
         if image_aspect >= sensor_aspect:
              return (f_mm / sensor_width_mm) * pixel_width
         else:
              return (f_mm / sensor_height_mm) * pixel_height
+
+
+def get_effective_f_mm_from_pixels(f_pixels, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height):
+    if not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+        return None
+
+    fit_mode = sensor_fit
+    if fit_mode == 'AUTO':
+        sensor_aspect = sensor_width_mm / sensor_height_mm if sensor_height_mm > 0 else 1.5
+        image_aspect = pixel_width / pixel_height if pixel_height > 0 else 1.0
+        fit_mode = 'HORIZONTAL' if image_aspect >= sensor_aspect else 'VERTICAL'
+
+    if fit_mode == 'VERTICAL':
+        if pixel_height <= 1e-8 or sensor_height_mm <= 1e-8:
+            return None
+        return float((f_pixels / pixel_height) * sensor_height_mm)
+
+    if pixel_width <= 1e-8 or sensor_width_mm <= 1e-8:
+        return None
+    return float((f_pixels / pixel_width) * sensor_width_mm)
+
+
 
 def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None, anchor_location=None, anchor_screen_offset=None):
     """
@@ -672,3 +1161,227 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix):
         
     # 作为 Blender 矩阵返回 (Cam->World)
     return mathutils.Matrix(R.T)
+
+
+
+def solve_strict_mode_constrained(
+    lines_data,
+    current_f_mm,
+    sensor_width_mm,
+    sensor_height_mm,
+    sensor_fit,
+    pixel_width,
+    pixel_height,
+    current_rot_matrix,
+    allow_focal_refine=True,
+):
+    f_seed = float(max(current_f_mm, 1e-6))
+
+    if allow_focal_refine:
+        refinement = refine_focal_length_for_constrained_rotation(
+            lines_data,
+            f_seed,
+            sensor_width_mm,
+            sensor_height_mm,
+            sensor_fit,
+            pixel_width,
+            pixel_height,
+            current_rot_matrix,
+        )
+
+        if refinement.get('reliable', False):
+            f_mm = float(refinement.get('f_mm', f_seed))
+            focal_state = 'refined'
+        else:
+            f_mm = f_seed
+            focal_state = 'locked'
+    else:
+        refinement = {
+            'f_mm': float(f_seed),
+            'reliable': False,
+            'baseline_residual': float('inf'),
+            'best_residual': float('inf'),
+        }
+        f_mm = f_seed
+        focal_state = 'fixed'
+
+    f_pixels = get_effective_f_pixels(
+        f_mm,
+        sensor_width_mm,
+        sensor_height_mm,
+        sensor_fit,
+        pixel_width,
+        pixel_height,
+    )
+    if not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+        return {
+            'ok': False,
+            'f_mm': f_seed,
+            'focal_state': focal_state,
+            'refinement': refinement,
+            'rot_matrix': None,
+            'residual': float('inf'),
+        }
+
+    rot_matrix = solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix)
+    if rot_matrix is None:
+        return {
+            'ok': False,
+            'f_mm': f_mm,
+            'focal_state': focal_state,
+            'refinement': refinement,
+            'rot_matrix': None,
+            'residual': float('inf'),
+        }
+
+    residual = compute_rotation_constraint_residual(lines_data, rot_matrix, f_pixels)
+
+    return {
+        'ok': True,
+        'f_mm': float(f_mm),
+        'focal_state': focal_state,
+        'refinement': refinement,
+        'rot_matrix': rot_matrix,
+        'residual': float(residual),
+    }
+
+
+def compute_rotation_constraint_residual(lines_data, rot_matrix, f_pixels):
+    if rot_matrix is None or f_pixels is None or not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+        return float('inf')
+
+    try:
+        R_world_to_cam = np.array(rot_matrix).T
+    except Exception:
+        return float('inf')
+
+    axis_index = {'X': 0, 'Y': 1, 'Z': 2}
+    total_error = 0.0
+    total_weight = 0.0
+
+    for axis, col_idx in axis_index.items():
+        axis_lines = lines_data.get(axis, [])
+        if not axis_lines:
+            continue
+
+        axis_vec = np.array(R_world_to_cam[:, col_idx], dtype=float)
+        axis_norm = np.linalg.norm(axis_vec)
+        if axis_norm <= 1e-8:
+            continue
+        axis_vec /= axis_norm
+
+        for line in axis_lines:
+            a, b, c, length = line
+            n = np.array([a, b, -c / float(f_pixels)], dtype=float)
+            n_norm = np.linalg.norm(n)
+            if n_norm <= 1e-8:
+                continue
+            n /= n_norm
+
+            weight = max(float(length), 1e-6)
+            err = abs(float(np.dot(axis_vec, n)))
+            total_error += err * weight
+            total_weight += weight
+
+    if total_weight <= 1e-8:
+        return float('inf')
+
+    return total_error / total_weight
+
+
+def refine_focal_length_for_constrained_rotation(
+    lines_data,
+    current_f_mm,
+    sensor_width_mm,
+    sensor_height_mm,
+    sensor_fit,
+    pixel_width,
+    pixel_height,
+    current_rot_matrix,
+):
+    active_axes = [axis for axis in ('X', 'Y', 'Z') if len(lines_data.get(axis, [])) >= 1]
+    if len(active_axes) < 2:
+        return {
+            'f_mm': float(current_f_mm),
+            'reliable': False,
+            'baseline_residual': float('inf'),
+            'best_residual': float('inf'),
+        }
+
+    current_f = max(float(current_f_mm), 1e-6)
+    coarse_factors = np.linspace(0.35, 2.3, 24)
+    fine_factors = np.linspace(0.80, 1.25, 19)
+    factors = sorted({float(v) for v in np.concatenate((coarse_factors, fine_factors, np.array([1.0])))})
+
+    candidates = []
+    for factor in factors:
+        f_candidate = float(np.clip(current_f * factor, 8.0, 2000.0))
+        if not any(abs(f_candidate - prev) < 1e-6 for prev in candidates):
+            candidates.append(f_candidate)
+
+    if all(abs(candidate - current_f) > 1e-6 for candidate in candidates):
+        candidates.append(current_f)
+
+    scored = []
+    for f_candidate in candidates:
+        f_pixels = get_effective_f_pixels(
+            f_candidate,
+            sensor_width_mm,
+            sensor_height_mm,
+            sensor_fit,
+            pixel_width,
+            pixel_height,
+        )
+        if not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+            continue
+
+        rot_candidate = solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix)
+        if rot_candidate is None:
+            continue
+
+        residual = compute_rotation_constraint_residual(lines_data, rot_candidate, f_pixels)
+        if not np.isfinite(residual):
+            continue
+
+        proximity_penalty = 0.008 * abs(math.log(max(f_candidate, 1e-6) / current_f))
+        score = residual + proximity_penalty
+        scored.append((score, residual, f_candidate, rot_candidate))
+
+    if not scored:
+        return {
+            'f_mm': float(current_f_mm),
+            'reliable': False,
+            'baseline_residual': float('inf'),
+            'best_residual': float('inf'),
+        }
+
+    scored.sort(key=lambda item: item[0])
+    _best_score, best_residual, best_f_mm, _best_rot = scored[0]
+
+    baseline_items = [item for item in scored if abs(item[2] - current_f) < 1e-6]
+    if baseline_items:
+        baseline_residual = baseline_items[0][1]
+    else:
+        baseline_residual = best_residual
+
+    improvement = baseline_residual - best_residual
+    improvement_ratio = improvement / max(abs(baseline_residual), 1e-6)
+    changed = abs(best_f_mm - current_f) > max(0.1, current_f * 0.01)
+
+    reliable = (
+        changed
+        and np.isfinite(baseline_residual)
+        and np.isfinite(best_residual)
+        and (
+            best_residual <= baseline_residual * 0.97
+            or improvement >= 0.003
+            or improvement_ratio >= 0.02
+        )
+    )
+
+    return {
+        'f_mm': float(best_f_mm if reliable else current_f_mm),
+        'reliable': bool(reliable),
+        'baseline_residual': float(baseline_residual),
+        'best_residual': float(best_residual),
+    }

@@ -9,15 +9,18 @@ from . import utils
 
 _handle = None
 
+
 def get_shader_2d_color():
     try:
         return gpu.shader.from_builtin('2D_UNIFORM_COLOR')
     except Exception:
         return gpu.shader.from_builtin('UNIFORM_COLOR')
 
+
 # 生成虚线顶点阵列
 def build_dashed_line(points, dash_length=12, gap_length=8):
-    if len(points) < 2: return []
+    if len(points) < 2:
+        return []
     speed = 50
     offset = (time.time() * speed) % (dash_length + gap_length)
 
@@ -27,10 +30,11 @@ def build_dashed_line(points, dash_length=12, gap_length=8):
 
     for i in range(len(points) - 1):
         a = points[i]
-        b = points[i+1]
+        b = points[i + 1]
         vec = (b[0] - a[0], b[1] - a[1])
         length = math.hypot(vec[0], vec[1])
-        if length == 0: continue
+        if length == 0:
+            continue
 
         # 防止极端坐标导致虚线细分循环过大造成卡死
         if length > max_screen_length:
@@ -39,7 +43,7 @@ def build_dashed_line(points, dash_length=12, gap_length=8):
 
         dir = (vec[0] / length, vec[1] / length)
 
-        current_pos = - (dash_length + gap_length) + offset
+        current_pos = -(dash_length + gap_length) + offset
         seg_count = 0
         while current_pos < length and seg_count < max_segments:
             start_d = max(0, current_pos)
@@ -70,6 +74,7 @@ def build_circle_lines(center, radius, seg=24):
         prev_pt = pt
     return verts
 
+
 # 生成实心圆顶点阵列 (类型为 TRIS)
 def build_filled_circle_tris(center, radius, seg=24):
     verts = []
@@ -84,21 +89,57 @@ def build_filled_circle_tris(center, radius, seg=24):
         prev_pt = pt
     return verts
 
+
+# 生成菱形实心三角顶点阵列 (类型为 TRIS)
+def build_filled_diamond_tris(center, radius):
+    cx, cy = center
+    top = (cx, cy + radius)
+    right = (cx + radius, cy)
+    bottom = (cx, cy - radius)
+    left = (cx - radius, cy)
+    return [
+        center, top, right,
+        center, right, bottom,
+        center, bottom, left,
+        center, left, top,
+    ]
+
+
+# 生成菱形线框顶点阵列 (类型为 LINES)
+def build_diamond_lines(center, radius):
+    cx, cy = center
+    top = (cx, cy + radius)
+    right = (cx + radius, cy)
+    bottom = (cx, cy - radius)
+    left = (cx - radius, cy)
+    return [
+        top, right,
+        right, bottom,
+        bottom, left,
+        left, top,
+    ]
+
+
 def draw_callback():
     try:
         context = bpy.context
-        if not context or not getattr(context, "scene", None): return
-        if not utils.is_camera_view(context): return
-        if not getattr(context.scene, "cmp_data", None) or not context.scene.cmp_data.lines: return
+        if not context or not getattr(context, "scene", None):
+            return
+        if not utils.is_camera_view(context):
+            return
+        if not getattr(context.scene, "cmp_data", None) or not context.scene.cmp_data.lines:
+            return
         cam = context.scene.camera
-        if not cam: return
+        if not cam:
+            return
 
         region = context.region
         rv3d = context.space_data.region_3d
 
         mw = cam.matrix_world
         TR, TL, BL, BR = utils.get_ordered_frame_points(context)
-        if not TR: return
+        if not TR:
+            return
 
         def get_world(u, v):
             top = TL.lerp(TR, u)
@@ -119,12 +160,16 @@ def draw_callback():
         }
         white = (1.0, 1.0, 1.0, 1.0)
         highlight_color = (1.0, 1.0, 0.0, 1.0)
+        horizon_color = (0.0, 1.0, 1.0, 0.9)
+        horizon_center_color = (0.0, 1.0, 1.0, 0.35)
 
         # 收集渲染数据 (按颜色分类)
         # 结构: batches[color] = {'LINES': [], 'TRIS': []}
         batches = {}
+
         def get_batch(c):
-            if c not in batches: batches[c] = {'LINES': [], 'TRIS': []}
+            if c not in batches:
+                batches[c] = {'LINES': [], 'TRIS': []}
             return batches[c]
 
         for i, line in enumerate(lines):
@@ -134,7 +179,8 @@ def draw_callback():
             p1_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, p1_3d)
             p2_2d = view3d_utils.location_3d_to_region_2d(region, rv3d, p2_3d)
 
-            if p1_2d is None or p2_2d is None: continue
+            if p1_2d is None or p2_2d is None:
+                continue
 
             color = cols.get(line.axis, white)
             if i == active_idx and not is_creating_line:
@@ -146,7 +192,7 @@ def draw_callback():
             # 只有在进入绘制/编辑模式时才显示控制点
             if is_drawing_mode:
                 # 2. 中点实心和外圈
-                mid_2d = ((p1_2d[0] + p2_2d[0])/2, (p1_2d[1] + p2_2d[1])/2)
+                mid_2d = ((p1_2d[0] + p2_2d[0]) / 2, (p1_2d[1] + p2_2d[1]) / 2)
                 get_batch(color)['TRIS'].extend(build_filled_circle_tris(mid_2d, 5))
                 get_batch(white)['LINES'].extend(build_circle_lines(mid_2d, 7))
 
@@ -155,6 +201,37 @@ def draw_callback():
                     for pt_2d in [p1_2d, p2_2d]:
                         get_batch(color)['TRIS'].extend(build_filled_circle_tris(pt_2d, 6))
                         get_batch(white)['LINES'].extend(build_circle_lines(pt_2d, 8))
+
+        cmp_data = context.scene.cmp_data
+        if cmp_data.horizon_enabled:
+            render = context.scene.render
+            pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+            geo = utils.compute_horizon_overlay_geometry(
+                lines,
+                cmp_data,
+                pixel_res_x,
+                pixel_res_y,
+                region.width,
+                region.height,
+                context=context,
+            )
+
+            if geo is not None:
+                line_a = tuple(geo['line_region_a'])
+                line_b = tuple(geo['line_region_b'])
+                center = tuple(geo['center_region'])
+                offset_handle = tuple(geo['offset_handle_region'])
+                draw_line_flag = geo.get('draw_line', True)
+
+                if draw_line_flag:
+                    get_batch(horizon_color)['LINES'].extend(build_dashed_line([line_a, line_b], 20, 10))
+
+                # 保留中心点参考（非手柄）
+                get_batch(horizon_center_color)['TRIS'].extend(build_filled_circle_tris(center, 4))
+
+                # 仅保留偏移手柄（菱形）
+                get_batch(horizon_center_color)['TRIS'].extend(build_filled_diamond_tris(offset_handle, 7))
+                get_batch(horizon_color)['LINES'].extend(build_diamond_lines(offset_handle, 11))
 
         # 统一执行极少次数的绘制调用
         shader = get_shader_2d_color()
@@ -180,12 +257,13 @@ def draw_callback():
     except Exception as e:
         print(f"CMP 2D Draw Error: {e}")
 
+
 def redraw_timer():
     try:
         context = bpy.context
         screen = getattr(context, "screen", None)
         if context.scene and getattr(context.scene, "cmp_data", None) and context.scene.cmp_data.lines and screen:
-             for area in screen.areas:
+            for area in screen.areas:
                 if area.type != 'VIEW_3D':
                     continue
                 for space in area.spaces:
@@ -194,7 +272,8 @@ def redraw_timer():
                         break
     except Exception:
         pass
-    return 0.04 # 限制为大概 25fps
+    return 0.04  # 限制为大概 25fps
+
 
 def register():
     global _handle
@@ -204,6 +283,7 @@ def register():
     if not bpy.app.timers.is_registered(redraw_timer):
         bpy.app.timers.register(redraw_timer)
 
+
 def unregister():
     global _handle
     if _handle:
@@ -212,4 +292,3 @@ def unregister():
 
     if bpy.app.timers.is_registered(redraw_timer):
         bpy.app.timers.unregister(redraw_timer)
-
