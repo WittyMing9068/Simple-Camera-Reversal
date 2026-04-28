@@ -23,13 +23,29 @@ def solve_camera_core(context):
     render = scene.render
     pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
 
-    # 1. 准备数据
+    # 1. 计算真实的像主点 (考虑 shift_x/y)
+    cursor_location = scene.cursor.location.copy()
+    current_dist = (cam.location - cursor_location).length
+    if current_dist < 0.1: current_dist = 10.0
+
+    principal_u = 0.5
+    principal_v = 0.5
+    probe_dist = max(current_dist, 1.0)
+    probe_world = cam.matrix_world.translation + (cam.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, -probe_dist)))
+    principal_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, probe_world)
+    if np.isfinite(principal_view.x) and np.isfinite(principal_view.y):
+        principal_u = float(principal_view.x)
+        principal_v = float(principal_view.y)
+
+    # 2. 准备数据
     lines_data, vp_data_raw, vp_data, axis_weights, horizon_data = utils.solve_horizon_data(
         lines,
         pixel_res_x,
         pixel_res_y,
         scene.cmp_data.horizon_enabled,
         scene.cmp_data.horizon_offset_px,
+        principal_u,
+        principal_v,
     )
 
     active_axes = [axis for axis in ('X', 'Y', 'Z') if len(lines_data.get(axis, [])) >= 1]
@@ -60,14 +76,7 @@ def solve_camera_core(context):
     try:
         cursor_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
 
-        principal_u = 0.5
-        principal_v = 0.5
-        probe_dist = max(current_dist, 1.0)
-        probe_world = cam.matrix_world.translation + (cam.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, -probe_dist)))
-        principal_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, probe_world)
-        if np.isfinite(principal_view.x) and np.isfinite(principal_view.y):
-            principal_u = float(principal_view.x)
-            principal_v = float(principal_view.y)
+        # principal_u 和 principal_v 已经在开头计算好了
 
         if np.isfinite(cursor_view.x) and np.isfinite(cursor_view.y):
             target_cursor_uv = (float(cursor_view.x), float(cursor_view.y))
@@ -77,11 +86,11 @@ def solve_camera_core(context):
             )
 
             if scene.cmp_data.horizon_enabled and horizon_data is not None:
-                cursor_px = utils.uv_to_centered_px(target_cursor_uv, pixel_res_x, pixel_res_y)
+                cursor_px = utils.uv_to_centered_px(target_cursor_uv, pixel_res_x, pixel_res_y, principal_u, principal_v)
                 dist_to_horizon = abs(utils.signed_distance_to_line_2d(cursor_px, horizon_data['line']))
                 if dist_to_horizon <= HORIZON_LOCK_THRESHOLD_PX:
                     proj_px = utils.project_point_to_line_2d(cursor_px, horizon_data['point'], horizon_data['direction'])
-                    horizon_target_uv = utils.centered_px_to_uv(proj_px, pixel_res_x, pixel_res_y)
+                    horizon_target_uv = utils.centered_px_to_uv(proj_px, pixel_res_x, pixel_res_y, principal_u, principal_v)
 
                     proj_offset = (
                         float((horizon_target_uv[0] - principal_u) * pixel_res_x),

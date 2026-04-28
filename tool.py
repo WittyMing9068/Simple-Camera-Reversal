@@ -343,6 +343,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 self.state = self.STATE_IDLE
                 self.horizon_drag_shift_state = None
                 self.end_horizon_drag_updates()
+                self.trigger_solve(context, force=True)
 
         return {'RUNNING_MODAL'}
 

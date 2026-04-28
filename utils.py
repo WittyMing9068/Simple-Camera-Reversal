@@ -107,21 +107,21 @@ def get_effective_render_size(render):
     return res_x, res_y
 
 
-def uv_to_centered_px(uv, pixel_res_x, pixel_res_y):
+def uv_to_centered_px(uv, pixel_res_x, pixel_res_y, principal_u=0.5, principal_v=0.5):
     u, v = uv
     return np.array([
-        (float(u) - 0.5) * float(pixel_res_x),
-        (float(v) - 0.5) * float(pixel_res_y),
+        (float(u) - principal_u) * float(pixel_res_x),
+        (float(v) - principal_v) * float(pixel_res_y),
     ], dtype=float)
 
 
-def centered_px_to_uv(point_px, pixel_res_x, pixel_res_y):
+def centered_px_to_uv(point_px, pixel_res_x, pixel_res_y, principal_u=0.5, principal_v=0.5):
     x, y = point_px
     px = float(pixel_res_x) if pixel_res_x else 1.0
     py = float(pixel_res_y) if pixel_res_y else 1.0
     return (
-        float(x) / px + 0.5,
-        float(y) / py + 0.5,
+        float(x) / px + principal_u,
+        float(y) / py + principal_v,
     )
 
 
@@ -175,9 +175,9 @@ def render_centered_px_to_camera_region_xy(context, point_px, render_res_x, rend
     return np.array([float(p_region[0]), float(p_region[1])], dtype=float)
 
 
-def build_axis_line_data(lines, pixel_res_x, pixel_res_y):
-    cx = pixel_res_x * 0.5
-    cy = pixel_res_y * 0.5
+def build_axis_line_data(lines, pixel_res_x, pixel_res_y, principal_u=0.5, principal_v=0.5):
+    cx = pixel_res_x * principal_u
+    cy = pixel_res_y * principal_v
     lines_data = {'X': [], 'Y': [], 'Z': []}
 
     for line in lines:
@@ -403,8 +403,8 @@ def signed_distance_to_line_2d(point, line):
     return float((ln[0] * p[0] + ln[1] * p[1] + ln[2]) / nrm)
 
 
-def solve_horizon_data(lines, pixel_res_x, pixel_res_y, horizon_enabled, horizon_offset_px):
-    lines_data = build_axis_line_data(lines, pixel_res_x, pixel_res_y)
+def solve_horizon_data(lines, pixel_res_x, pixel_res_y, horizon_enabled, horizon_offset_px, principal_u=0.5, principal_v=0.5):
+    lines_data = build_axis_line_data(lines, pixel_res_x, pixel_res_y, principal_u, principal_v)
     vp_raw, axis_weights = solve_vanishing_points(lines_data, pixel_res_x, pixel_res_y)
     vp_adj, horizon_data = apply_horizon_constraint_to_vps(
         vp_raw,
@@ -787,7 +787,7 @@ def get_effective_f_pixels(f_mm, sensor_width_mm, sensor_height_mm, sensor_fit, 
         sensor_aspect = sensor_width_mm / sensor_height_mm if sensor_height_mm > 0 else 1.5
         image_aspect = pixel_width / pixel_height if pixel_height > 0 else 1.0
 
-        if image_aspect >= sensor_aspect:
+        if pixel_width >= pixel_height:
              return (f_mm / sensor_width_mm) * pixel_width
         else:
              return (f_mm / sensor_height_mm) * pixel_height
@@ -801,7 +801,7 @@ def get_effective_f_mm_from_pixels(f_pixels, sensor_width_mm, sensor_height_mm, 
     if fit_mode == 'AUTO':
         sensor_aspect = sensor_width_mm / sensor_height_mm if sensor_height_mm > 0 else 1.5
         image_aspect = pixel_width / pixel_height if pixel_height > 0 else 1.0
-        fit_mode = 'HORIZONTAL' if image_aspect >= sensor_aspect else 'VERTICAL'
+        fit_mode = 'HORIZONTAL' if pixel_width >= pixel_height else 'VERTICAL'
 
     if fit_mode == 'VERTICAL':
         if pixel_height <= 1e-8 or sensor_height_mm <= 1e-8:
@@ -987,7 +987,7 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
         
         fit_mode = sensor_fit
         if fit_mode == 'AUTO':
-            if image_aspect >= sensor_aspect: fit_mode = 'HORIZONTAL'
+            if pixel_width >= pixel_height: fit_mode = 'HORIZONTAL'
             else: fit_mode = 'VERTICAL'
             
         if fit_mode == 'VERTICAL':
